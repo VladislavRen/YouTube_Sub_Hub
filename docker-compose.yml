@@ -1,0 +1,14 @@
+services:
+  neo4j:
+    image: neo4j:5-community
+    container_name: yt-sub-hub-neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: "${YT_SUB_HUB_NEO4J_USER:-neo4j}/${YT_SUB_HUB_NEO4J_PASSWORD:-change-me-in-.env}"
+    volumes:
+      - neo4j-data:/data
+
+volumes:
+  neo4j-data:

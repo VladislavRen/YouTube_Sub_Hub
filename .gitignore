@@ -1,0 +1,40 @@
+.env
+.env.*
+!.env.example
+
+# Local OAuth credentials and browser/session exports.
+token.json
+client_secret*.json
+client_secrets.json
+*.cookies
+*cookies*.txt
+
+# Runtime artifacts and generated media.
+library/
+*.db
+*.sqlite
+*.sqlite3
+*.mp3
+*.mp4
+*.wav
+*.m4a
+*.webm
+*.mkv
+*.mov
+*.aac
+*.flac
+*.ogg
+
+# Python/build/cache/local tooling.
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+htmlcov/
+.venv/
+.venv311/
+.idea/
+*.pyc
+*.py[cod]
+*.egg-info/
