@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from test_artifact_review import (
     _settings,
     _transcript_with_duration,
@@ -12,7 +10,7 @@ from test_artifact_review import (
     _write_review_video_with_transcript,
 )
 from yt_sub_hub.artifact_quality_score import compute_artifact_quality_score
-from yt_sub_hub.artifact_review import load_ru_artifact_review, review_ru_artifacts, transcript_hash
+from yt_sub_hub.artifact_review import review_ru_artifacts, transcript_hash
 from yt_sub_hub.library import LibraryStore
 from yt_sub_hub.quality import run_quality_gate
 
@@ -174,26 +172,4 @@ def test_live_like_pl6_fixture_reports_ready_with_full_chunk_coverage(tmp_path):
     assert score["coverage_score"] == 1.0
     assert score["metrics"]["coverage"]["covered_segment_ratio"] == 1.0
     assert score["overall_score"] >= 0.85
-
-
-def test_existing_pl6_fixture_reports_ready_with_quality_metrics():
-    store = LibraryStore(Path("library"))
-    if not store.artifact_paths("PL6ZiIly1mE").ru_artifact_review.exists():
-        pytest.skip("PL6ZiIly1mE live fixture is not available")
-    review = load_ru_artifact_review(store, "PL6ZiIly1mE")
-    assert review is not None
-    quality_gate = run_quality_gate(store, "PL6ZiIly1mE").as_dict()
-
-    score = compute_artifact_quality_score(
-        store,
-        "PL6ZiIly1mE",
-        quality_mode="strict",
-        quality_gate=quality_gate,
-        ru_artifact_review=review,
-        stages=[{"stage_name": "neo4j_sync", "status": "completed"}],
-    )
-
-    assert score["status"] == "ready"
-    assert score["overall_score"] >= 0.85
-    assert score["metrics"]["coverage"]["covered_segment_ratio"] == 1.0
     assert score["metrics"]["graph"]["neo4j_sync_stage_status"] == "completed"

@@ -8,7 +8,7 @@ from typing import Any, Protocol, runtime_checkable
 from yt_sub_hub.llm import extract_json_payload
 from yt_sub_hub.models import VideoMetadata
 
-VISUAL_PROMPT_VERSION = "vision-frame-v1"
+VISUAL_PROMPT_VERSION = "vision-frame-v2"
 VISUAL_FRAME_ANALYSIS_REQUIRED_FIELDS = [
     "screen_type",
     "summary",
@@ -163,6 +163,10 @@ class LMStudioVisionProvider:
                     "content": (
                         "Return only valid JSON that matches the visual_frame_analysis schema. "
                         "Describe only what is visible in this single frame and use the transcript only as nearby context. "
+                        "This is a screen capture: do not invent a physical monitor or video-player controls. "
+                        "A presenter overlay alone is not evidence of an embedded video player. "
+                        "Do not infer exact years, numbers, negative values, or financial meaning from tiny or blurry text. "
+                        "Describe the layout and topic; put unreadable details in uncertainties and lower confidence. "
                         "Do not provide financial advice."
                     ),
                 },

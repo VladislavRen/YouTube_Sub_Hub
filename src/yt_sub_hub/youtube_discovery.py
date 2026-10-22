@@ -3,9 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 import time
-from dataclasses import dataclass
+from contextlib import closing
+from copy import copy
+from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Any, Protocol
 
 from yt_sub_hub.channel import fetch_channel_listing
@@ -15,8 +19,9 @@ from yt_sub_hub.runtime import RuntimeStore
 from yt_sub_hub.youtube_data_api import build_youtube_client, google_api_error_class, sanitize_google_api_message
 
 SCHEMA_VERSION = "youtube-discovery-v1"
-SEARCH_LIST_QUOTA_UNITS = 100
+SEARCH_LIST_QUOTA_UNITS = 1
 DETAILS_LIST_QUOTA_UNITS = 1
+DEFAULT_MAX_SEARCH_CALLS = 100
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,32}$")
 CHANNEL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{3,64}$")
 QUERY_INTENTS = ("same_topic", "counterpoint", "deep_dive", "source_author", "channel_discovery", "recent_updates")
@@ -42,18 +47,104 @@ class YouTubeDiscoveryProvider(Protocol):
 
 @dataclass
 class QuotaBudget:
+    """Local run limits, never the project's remaining daily Google quota.
+
+    Persistent reservations are committed before requests and survive retries or
+    process exits. A crash before sending can conservatively overcount an attempt.
+    The same discovery_run_id retains usage; its limits can only be tightened.
+    """
+
     max_units: int = 900
     used_units: int = 0
+    max_search_calls: int = DEFAULT_MAX_SEARCH_CALLS
+    used_search_calls: int = 0
+    ledger_path: Path | None = None
+    run_id: str | None = None
+    _lock: Any = field(default_factory=Lock, repr=False, compare=False)
 
-    def consume(self, units: int, action: str) -> None:
-        if self.used_units + units > self.max_units:
-            raise DiscoveryValidationError(
-                f"YouTube Data API quota budget exceeded before {action}: {self.used_units + units}>{self.max_units}"
+    def __post_init__(self) -> None:
+        for name in ("max_units", "used_units", "max_search_calls", "used_search_calls"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or value < 0:
+                raise DiscoveryValidationError(f"{name} must be a non-negative integer")
+        if self.ledger_path is None:
+            return
+        if not self.run_id:
+            raise DiscoveryValidationError("discovery_run_id is required for a persistent quota budget")
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(self.ledger_path, timeout=30)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS discovery_quota ("
+                "run_id TEXT PRIMARY KEY, max_units INTEGER NOT NULL, used_units INTEGER NOT NULL, "
+                "max_search_calls INTEGER NOT NULL, used_search_calls INTEGER NOT NULL)"
             )
-        self.used_units += units
+            db.execute(
+                "INSERT OR IGNORE INTO discovery_quota VALUES (?, ?, ?, ?, ?)",
+                (self.run_id, self.max_units, self.used_units, self.max_search_calls, self.used_search_calls),
+            )
+            db.execute(
+                "UPDATE discovery_quota SET max_units = MIN(max_units, ?), "
+                "max_search_calls = MIN(max_search_calls, ?) WHERE run_id = ?",
+                (self.max_units, self.max_search_calls, self.run_id),
+            )
+            self._load_usage(db)
 
-    def to_dict(self) -> dict[str, int]:
-        return {"max_units": self.max_units, "used_units": self.used_units, "remaining_units": self.max_units - self.used_units}
+    def _load_usage(self, db: sqlite3.Connection) -> None:
+        row = db.execute(
+            "SELECT max_units, used_units, max_search_calls, used_search_calls FROM discovery_quota WHERE run_id = ?",
+            (self.run_id,),
+        ).fetchone()
+        if row is None:
+            raise DiscoveryValidationError("discovery run quota ledger is missing")
+        self.max_units, self.used_units, self.max_search_calls, self.used_search_calls = row
+
+    def consume(self, units: int, action: str, *, bucket: str = "general_data") -> None:
+        if not isinstance(units, int) or units < 0 or bucket not in {"general_data", "search"}:
+            raise DiscoveryValidationError("quota consumption requires non-negative units and a known bucket")
+        with self._lock:
+            if self.ledger_path is None:
+                self._consume(units, action, bucket)
+                return
+            with closing(sqlite3.connect(self.ledger_path, timeout=30)) as db, db:
+                db.execute("BEGIN IMMEDIATE")
+                self._load_usage(db)
+                self._consume(units, action, bucket)
+                db.execute(
+                    "UPDATE discovery_quota SET used_units = ?, used_search_calls = ? WHERE run_id = ?",
+                    (self.used_units, self.used_search_calls, self.run_id),
+                )
+
+    def _consume(self, units: int, action: str, bucket: str) -> None:
+        used, maximum = (self.used_search_calls, self.max_search_calls) if bucket == "search" else (self.used_units, self.max_units)
+        if used + units > maximum:
+            raise DiscoveryValidationError(
+                f"YouTube Data API {bucket} run quota budget exceeded before {action}: {used + units}>{maximum}"
+            )
+        if bucket == "search":
+            self.used_search_calls += units
+        else:
+            self.used_units += units
+
+    def to_dict(self) -> dict[str, Any]:
+        with self._lock:
+            if self.ledger_path is not None:
+                with closing(sqlite3.connect(self.ledger_path, timeout=30)) as db:
+                    self._load_usage(db)
+            return {
+                "scope": "discovery_run",
+                "accounting": "local_request_reservations_including_failures",
+                "discovery_run_id": self.run_id,
+                "general_units_bucket": "general_data",
+                "max_units": self.max_units,
+                "used_units": self.used_units,
+                "remaining_units": max(0, self.max_units - self.used_units),
+                "max_search_calls": self.max_search_calls,
+                "used_search_calls": self.used_search_calls,
+                "remaining_search_calls": max(0, self.max_search_calls - self.used_search_calls),
+                "project_daily_remaining": None,
+                "project_quota_authority": "Google Cloud Console",
+            }
 
 
 class YouTubeDataApiDiscoveryProvider:
@@ -63,7 +154,7 @@ class YouTubeDataApiDiscoveryProvider:
         self.quota_budget = quota_budget or QuotaBudget()
 
     def search_videos(self, query: str, limit: int) -> list[dict[str, Any]]:
-        self.quota_budget.consume(SEARCH_LIST_QUOTA_UNITS, "search.list videos")
+        self.quota_budget.consume(SEARCH_LIST_QUOTA_UNITS, "search.list videos", bucket="search")
         response = self._execute(
             self.youtube.search().list(
                 part="snippet",
@@ -93,7 +184,7 @@ class YouTubeDataApiDiscoveryProvider:
         return results
 
     def search_channels(self, query: str, limit: int) -> list[dict[str, Any]]:
-        self.quota_budget.consume(SEARCH_LIST_QUOTA_UNITS, "search.list channels")
+        self.quota_budget.consume(SEARCH_LIST_QUOTA_UNITS, "search.list channels", bucket="search")
         response = self._execute(
             self.youtube.search().list(
                 part="snippet",
@@ -197,6 +288,15 @@ def discovery_dir_for(store: LibraryStore, video_id: str) -> Path:
     return store.video_dir(video_id) / "youtube_discovery"
 
 
+def _discovery_run_quota(discovery_dir: Path, run_id: str, max_units: int, max_search_calls: int) -> QuotaBudget:
+    return QuotaBudget(
+        max_units=max_units,
+        max_search_calls=max_search_calls,
+        ledger_path=discovery_dir / "quota.sqlite3",
+        run_id=run_id,
+    )
+
+
 def discovery_status_payload(store: LibraryStore, video_id: str) -> dict[str, Any]:
     path = discovery_dir_for(store, video_id) / "status.json"
     return _read_json(path) if path.exists() else {"video_id": video_id, "status": "not_started"}
@@ -206,7 +306,7 @@ def read_discovery_stage_options(stage_payload_json: str | None) -> dict[str, An
     payload = json.loads(stage_payload_json) if stage_payload_json else {}
     return {
         "limit": int(payload.get("limit") or 20),
-        "max_quota_units": int(payload.get("max_quota_units") or 900),
+        "max_quota_units": int(payload.get("max_quota_units", 900)),
     }
 
 
@@ -244,13 +344,21 @@ def extract_discovery_seeds_stage(store: LibraryStore, video_id: str, *, limit: 
     return seeds
 
 
-def expand_discovery_queries_stage(store: LibraryStore, video_id: str, *, max_quota_units: int = 900) -> dict[str, Any]:
+def expand_discovery_queries_stage(
+    store: LibraryStore,
+    video_id: str,
+    *,
+    max_quota_units: int = 900,
+    max_search_calls: int = DEFAULT_MAX_SEARCH_CALLS,
+) -> dict[str, Any]:
     discovery_dir = discovery_dir_for(store, video_id)
     seeds = _read_json(discovery_dir / "seeds.json")
     research_run_id = str(seeds["research_run_id"])
     discovery_run_id = str(seeds["discovery_run_id"])
-    max_queries = max(1, int(max_quota_units) // _estimated_query_quota_units())
+    quota = _discovery_run_quota(discovery_dir, discovery_run_id, max_quota_units, max_search_calls)
+    max_queries = min(quota.max_units // _estimated_query_quota_units(), quota.max_search_calls // 2)
     queries = _plan_queries(video_id, research_run_id, discovery_run_id, seeds, max_queries=max_queries)
+    queries["quota_budget"] = quota.to_dict()
     _write_json(discovery_dir / "queries.json", queries)
     return queries
 
@@ -263,15 +371,20 @@ def execute_discovery_query_stage(
     provider: YouTubeDiscoveryProvider | None = None,
     settings: Any | None = None,
     max_quota_units: int = 900,
+    max_search_calls: int = DEFAULT_MAX_SEARCH_CALLS,
     limit: int = 20,
 ) -> dict[str, Any]:
     discovery_dir = discovery_dir_for(store, video_id)
     query_results_dir = discovery_dir / "query_results"
     query_results_dir.mkdir(parents=True, exist_ok=True)
-    quota = QuotaBudget(max_units=max_quota_units)
+    seeds = _read_json(discovery_dir / "seeds.json")
+    quota = _discovery_run_quota(discovery_dir, str(seeds.get("discovery_run_id") or ""), max_quota_units, max_search_calls)
     if provider is None:
         provider = YouTubeDataApiDiscoveryProvider(settings or _settings(), quota_budget=quota)
     elif isinstance(provider, YouTubeDataApiDiscoveryProvider):
+        # A provider can be shared by concurrently running stages. Never replace
+        # another stage's budget on that shared instance.
+        provider = copy(provider)
         provider.quota_budget = quota
     query_id = str(query.get("query_id") or "")
     per_query_limit = max(1, min(10, int(limit)))
@@ -627,7 +740,7 @@ def review_youtube_discovery(
         )
     active_queries = _active_query_items(queries)
     max_queries = _int_or_none(queries.get("max_queries"))
-    query_budget_exhausted = max_queries is not None and len(active_queries) >= max(1, max_queries)
+    query_budget_exhausted = max_queries is not None and len(active_queries) >= max(0, max_queries)
     active_seed_ids = {str(seed_id) for query in active_queries for seed_id in query.get("seed_ids") or []}
     for seed in seeds.get("items") or []:
         seed_id = str(seed.get("seed_id") or "")
@@ -1014,19 +1127,11 @@ def _require_research_ready(store: LibraryStore, video_id: str) -> str:
     review = _read_json(review_path)
     if review.get("status") != "passed":
         raise DiscoveryValidationError("discovery requires research_artifact_review status passed")
-    plan_path = research_dir / "research_plan.json"
-    graph_path = research_dir / "research_graph.json"
-    for path in [plan_path, research_dir / "findings.ru.json", research_dir / "source_summaries.json"]:
-        if not path.exists():
-            raise DiscoveryValidationError(f"discovery requires research artifact: {path.name}")
-    plan = _read_json(plan_path)
-    if plan.get("research_run_id"):
-        return str(plan["research_run_id"])
-    if graph_path.exists():
-        graph = _read_json(graph_path)
-        if graph.get("research_run_id"):
-            return str(graph["research_run_id"])
-    raise DiscoveryValidationError("discovery requires research_run_id")
+    from yt_sub_hub.research_enrichment import require_current_research_run, ResearchValidationError
+    try:
+        return require_current_research_run(store, video_id)
+    except ResearchValidationError as exc:
+        raise DiscoveryValidationError(str(exc)) from exc
 
 
 def _extract_seeds(
@@ -1209,13 +1314,18 @@ def _query_dedupe_key(intent: str, language: str, query_text: str) -> str:
     return _normalize(f"{query_text}:{intent}:{language}")
 
 
-def _quota_estimate() -> dict[str, int]:
+def _quota_estimate() -> dict[str, Any]:
     return {
         "search_video_units": SEARCH_LIST_QUOTA_UNITS,
         "search_channel_units": SEARCH_LIST_QUOTA_UNITS,
+        "search_calls": 2,
+        "search_units_bucket": "search",
         "video_details_units": DETAILS_LIST_QUOTA_UNITS,
         "channel_details_units": DETAILS_LIST_QUOTA_UNITS,
+        "general_units": _estimated_query_quota_units(),
+        # Retained for existing artifact readers; search has its own bucket.
         "total_units": _estimated_query_quota_units(),
+        "total_units_bucket": "general_data",
     }
 
 
@@ -1241,7 +1351,11 @@ def _plan_queries(
     *,
     max_queries: int = 8,
 ) -> dict[str, Any]:
+    if max_queries < 0:
+        raise DiscoveryValidationError("max_queries must be non-negative")
     items: list[dict[str, Any]] = []
+    if max_queries == 0:
+        return _queries_artifact(video_id, research_run_id, discovery_run_id, seeds.get("input_hashes") or {}, items, max_queries=0)
     seen = set()
     priority = 1
     executable_count = 0
@@ -1266,7 +1380,7 @@ def _plan_queries(
                 if dedupe_key in seen:
                     continue
                 seen.add(dedupe_key)
-                if rejected_reason is None and executable_count >= max(1, int(max_queries)):
+                if rejected_reason is None and executable_count >= int(max_queries):
                     return _queries_artifact(video_id, research_run_id, discovery_run_id, seeds.get("input_hashes") or {}, items, max_queries=max_queries)
                 items.append(
                     {
@@ -1285,13 +1399,13 @@ def _plan_queries(
                 priority += 1
                 if rejected_reason is None:
                     executable_count += 1
-                if executable_count >= max(1, int(max_queries)):
+                if executable_count >= int(max_queries):
                     return _queries_artifact(video_id, research_run_id, discovery_run_id, seeds.get("input_hashes") or {}, items, max_queries=max_queries)
     return _queries_artifact(video_id, research_run_id, discovery_run_id, seeds.get("input_hashes") or {}, items, max_queries=max_queries)
 
 
 def _estimated_query_quota_units() -> int:
-    return (SEARCH_LIST_QUOTA_UNITS * 2) + (DETAILS_LIST_QUOTA_UNITS * 2)
+    return DETAILS_LIST_QUOTA_UNITS * 2
 
 
 def _merge_video_candidates(
@@ -1355,6 +1469,7 @@ def _video_candidate(video_id: str, data: dict[str, Any], query: dict[str, Any],
         "seed_ids": seed_ids,
         "source_ids": seed_ids,
         "relationship": _relationship_for_query(query),
+        "query_intents": [query.get("intent") or "unknown"],
         "review_status": "needs_review",
         "processed_status": "new",
         "reason": f"Matched seed '{seed_text}' via query '{query['query']}'.",
@@ -1378,7 +1493,8 @@ def _channel_candidate(channel_id: str, data: dict[str, Any], query: dict[str, A
         "query_ids": [query["query_id"]],
         "seed_ids": seed_ids,
         "source_ids": seed_ids,
-        "relationship": "expands",
+        "relationship": "unclear",
+        "query_intents": [query.get("intent") or "unknown"],
         "review_status": "needs_review",
         "reason": f"Matched seed '{seed_text}' via channel query '{query['query']}'.",
     }
@@ -1456,7 +1572,7 @@ def _queries_artifact(
     max_queries: int,
 ) -> dict[str, Any]:
     payload = _artifact_root("queries", video_id, research_run_id, discovery_run_id, input_hashes, items)
-    payload["max_queries"] = max(1, int(max_queries))
+    payload["max_queries"] = max(0, int(max_queries))
     payload["active_query_count"] = len(_active_query_items(payload))
     return payload
 
@@ -1552,9 +1668,13 @@ def _input_hashes(store: LibraryStore, video_id: str) -> dict[str, str]:
 
 
 def _quota_usage(provider: YouTubeDiscoveryProvider, quota: QuotaBudget, *, max_quota_units: int) -> dict[str, Any]:
+    usage = quota.to_dict()
     if isinstance(provider, YouTubeDataApiDiscoveryProvider):
-        return quota.to_dict()
-    return {"max_units": max_quota_units, "used_units": None, "remaining_units": None}
+        return usage
+    # Alternate providers do not expose their Google request attempts.
+    usage.update(accounting="unavailable_for_provider", used_units=None, remaining_units=None,
+                 used_search_calls=None, remaining_search_calls=None)
+    return usage
 
 
 def _write_discovery_status(
@@ -1639,6 +1759,7 @@ def _append_audit(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _merge_provenance(candidate: dict[str, Any], query: dict[str, Any], seed_ids: list[str]) -> None:
+    candidate["query_intents"] = _dedupe([*candidate.get("query_intents", []), query.get("intent") or "unknown"])
     candidate["query_ids"] = _dedupe([*candidate.get("query_ids", []), query["query_id"]])
     candidate["seed_ids"] = _dedupe([*candidate.get("seed_ids", []), *seed_ids])
     candidate["source_ids"] = _dedupe([*candidate.get("source_ids", []), *seed_ids])
@@ -1650,12 +1771,8 @@ def _update_best_score(candidate: dict[str, Any], scores: dict[str, float]) -> N
 
 
 def _relationship_for_query(query: dict[str, Any]) -> str:
-    intent = query.get("intent")
-    if intent == "counterpoint":
-        return "contradicts"
-    if intent in {"deep_dive", "recent_updates", "channel_discovery"}:
-        return "expands"
-    return "supports"
+    # Search intent is provenance, not evidence of a video's semantic stance.
+    return "unclear"
 
 
 def _relation_counts(video_candidates: dict[str, Any], channel_candidates: dict[str, Any]) -> dict[str, int]:

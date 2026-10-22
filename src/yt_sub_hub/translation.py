@@ -4,7 +4,7 @@ import json
 import time
 from typing import Any
 
-from yt_sub_hub.language_quality import contains_cyrillic
+from yt_sub_hub.language_quality import contains_cyrillic, is_technical_abbreviation
 from yt_sub_hub.llm import extract_json_payload
 from yt_sub_hub.models import Analysis, Claim, Concept, NoteSection, Transcript, TranscriptSegment
 
@@ -424,8 +424,8 @@ class LMStudioTranslationProvider:
                 ),
             )
             return self._parse_analysis_item_batch(data, items, target)
-        except TranslationError as exc:
-            if len(items) == 1 and target.strip().lower() == "ru" and "did not produce Russian text" in str(exc):
+        except TranslationError:
+            if len(items) == 1 and target.strip().lower() == "ru":
                 return self._translate_analysis_single_item_forced(items[0], source_language, target)
             if len(items) <= 1:
                 raise
@@ -445,19 +445,22 @@ class LMStudioTranslationProvider:
             {
                 "source_language": source_language or "unknown",
                 "target_language": target,
-                "items": [item],
+                "text": item["text"],
             },
             target,
-            build_analysis_text_translation_response_format(),
+            build_text_translation_response_format(),
             (
-                "Repair this single analysis field. Return the same path and translate text into Russian. "
-                "If the source is mostly names, tickers, or numbers, wrap the preserved terms in a concise Russian sentence."
+                "Translate this single analysis field into Russian and return translated_text. "
+                "Translate descriptive labels and prose; preserve technical abbreviations and names. "
+                "Do not add generic filler or commentary."
             ),
         )
-        try:
-            return self._parse_analysis_item_batch(data, [item], target)
-        except TranslationError:
-            return {item["path"]: _ru_wrapped_analysis_item(item)}
+        text = data.get("translated_text")
+        if not isinstance(text, str) or not text.strip():
+            raise TranslationError("Single-field translation response is missing translated_text")
+        return self._parse_analysis_item_batch(
+            {"items": [{"path": item["path"], "text": text}]}, [item], target,
+        )
 
     def translate_visual_frame(self, frame: dict[str, Any], target_language: str | None = None) -> dict[str, Any]:
         target = self._target(target_language)
@@ -522,13 +525,18 @@ class LMStudioTranslationProvider:
                 ),
             },
         ]
-        response = self._create_completion(
-            client,
-            model=model,
-            messages=messages,
-            temperature=0.1,
-            response_format=response_format,
-        )
+        try:
+            response = self._create_completion(
+                client,
+                model=model,
+                messages=messages,
+                temperature=0.1,
+                response_format=response_format,
+            )
+        finally:
+            close = getattr(client, "close", None)
+            if close is not None:
+                close()
         content = response.choices[0].message.content or "{}"
         self.last_raw_response = {
             "model": model,
@@ -658,7 +666,15 @@ class LMStudioTranslationProvider:
             if path != expected_path:
                 raise TranslationError("Analysis translation item path/order changed")
             text = _string(translated_item.get("text"))
-            if target.strip().lower() == "ru" and text and not contains_cyrillic(text):
+            preserved_abbreviation = (
+                is_technical_abbreviation(text)
+                and text.strip() == source_item["text"].strip()
+                and (
+                    path.startswith(("tags.", "outline.", "related_topics."))
+                    or path.endswith((".name", ".heading"))
+                )
+            )
+            if target.strip().lower() == "ru" and text and not contains_cyrillic(text) and not preserved_abbreviation:
                 raise TranslationError(f"Analysis translation item {path} did not produce Russian text")
             result[path] = text
         return result

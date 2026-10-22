@@ -64,6 +64,48 @@ def test_doctor_report_fails_when_required_model_is_missing():
     assert "lm_studio_model:qwen/qwen3.6-35b-a3b" in report.failed_names
 
 
+@pytest.mark.parametrize("content,finish_reason,ok", [
+    ('{"ok": true}', "stop", True),
+    ("", "length", False),
+    ('{"ok": true}', "length", False),
+    ("thinking only", "stop", False),
+    ('{"ok": false}', "stop", False),
+    ('{"ok": 1}', "stop", False),
+    ('[]', "stop", False),
+])
+def test_generation_probe_checks_json_answer(monkeypatch, content, finish_reason, ok):
+    import httpx
+    from yt_sub_hub.doctor import _check_lm_generation
+
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: httpx.Response(200, json={
+        "choices": [{"finish_reason": finish_reason, "message": {
+            "content": content, "reasoning_content": "model reasoning is not the answer",
+        }}],
+    }))
+
+    result = _check_lm_generation(doctor_settings(), "qwen")
+
+    assert result.ok is ok
+    if not ok:
+        assert "JSON" in result.detail
+
+
+def test_media_fallback_reports_missing_javascript_runtime(monkeypatch):
+    from yt_sub_hub.doctor import _check_media_dependencies
+
+    monkeypatch.setattr("yt_sub_hub.doctor.shutil.which", lambda name: None)
+    checks = _check_media_dependencies(doctor_settings(media_download_enabled=True, acceptance_mode="full_processing"))
+    assert any(not check.ok and "JavaScript" in check.name for check in checks)
+    assert any("YT_SUB_HUB_YTDLP_JS_RUNTIME" in check.detail for check in checks)
+
+
+def test_official_mode_does_not_require_javascript_runtime(monkeypatch):
+    from yt_sub_hub.doctor import _check_media_dependencies
+
+    monkeypatch.setattr("yt_sub_hub.doctor.shutil.which", lambda name: None)
+    assert _check_media_dependencies(doctor_settings()) == []
+
+
 def test_doctor_reports_ytdlp_proxy_cookie_settings_and_metadata_probe(tmp_path, monkeypatch):
     stub_base_doctor_checks(monkeypatch)
     cookies_file = tmp_path / "youtube-cookies.txt"

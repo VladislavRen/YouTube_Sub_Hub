@@ -301,6 +301,7 @@ def test_local_orchestrator_parallelizes_discovery_query_stages_under_youtube_da
     events = []
     events_lock = threading.Lock()
     active = {"count": 0, "max": 0}
+    two_queries_running = threading.Event()
 
     def query_handler(ctx):
         started = time.monotonic()
@@ -308,6 +309,10 @@ def test_local_orchestrator_parallelizes_discovery_query_stages_under_youtube_da
             active["count"] += 1
             active["max"] = max(active["max"], active["count"])
             events.append((ctx.stage.stage_name, "start", started))
+            if active["count"] == 2:
+                two_queries_running.set()
+        # Require overlap without imposing a thread-start latency on the host.
+        assert two_queries_running.wait(timeout=5)
         time.sleep(0.06)
         finished = time.monotonic()
         with events_lock:
@@ -328,8 +333,7 @@ def test_local_orchestrator_parallelizes_discovery_query_stages_under_youtube_da
         if event[1] == "start"
     ]
     assert len(windows) == 5
-    assert max(start for _, start, _ in windows[:2]) - min(start for _, start, _ in windows[:2]) < 0.05
-    assert active["max"] <= 2
+    assert active["max"] == 2
     assert all(_stage.status == "completed" for _stage in runtime.list_stage_plan(job.id) if _stage.stage_name.startswith("youtube_discovery_query_"))
 
 

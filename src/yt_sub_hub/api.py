@@ -13,7 +13,7 @@ from yt_sub_hub.orchestration import (
     sync_legacy_job_from_runtime,
     sync_legacy_requeued_job,
 )
-from yt_sub_hub.pipeline import VideoProcessingPipeline
+from yt_sub_hub.pipeline import VideoProcessingPipeline, job_id_for_url
 from yt_sub_hub.visual import VisualAnalysisError, VisualAnalysisService
 
 try:
@@ -182,8 +182,17 @@ def create_app():
 
         quality_mode = normalize_quality_mode(request.quality_mode or settings.quality_mode)
         acceptance_mode = normalize_acceptance_mode(request.acceptance_mode or settings.acceptance_mode)
-        record = create_job_record(request.url, settings.library_dir)
         runtime = runtime_store()
+        # Reject conflicting retry options before submit can recover an aged legacy record.
+        try:
+            runtime.update_video_job_modes(
+                job_id_for_url(request.url), quality_mode=request.quality_mode, acceptance_mode=request.acceptance_mode,
+            )
+        except KeyError:
+            pass  # First submission has no runtime record yet.
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        record = create_job_record(request.url, settings.library_dir)
         runtime_record = runtime.create_video_job(
             job_id=record.job_id,
             video_id=record.video_id,
@@ -192,6 +201,12 @@ def create_app():
             quality_mode=quality_mode,
             acceptance_mode=acceptance_mode,
         )
+        try:
+            runtime_record = runtime.update_video_job_modes(
+                runtime_record.id, quality_mode=request.quality_mode, acceptance_mode=request.acceptance_mode,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if runtime_record.status not in {"queued", "running"}:
             runtime_record = runtime.resume_video_job(runtime_record.id)
             sync_legacy_requeued_job(store, runtime_record)

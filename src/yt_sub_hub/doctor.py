@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import shutil
 import subprocess
 import sys
@@ -106,6 +107,23 @@ def _check_lm_generation(settings: Settings, model: str) -> DoctorCheck:
         )
         if response.status_code >= 400:
             return DoctorCheck(f"lm_studio_generate:{model}", False, response.text)
+        try:
+            choice = response.json()["choices"][0]
+            answer = json.loads(choice["message"]["content"])
+            valid = (
+                choice.get("finish_reason") == "stop"
+                and isinstance(answer, dict)
+                and set(answer) == {"ok"}
+                and answer["ok"] is True
+            )
+        except (ValueError, KeyError, IndexError, TypeError):
+            valid = False
+        if not valid:
+            return DoctorCheck(
+                f"lm_studio_generate:{model}", False,
+                "Model did not finish the required JSON answer within the smoke-test token budget. "
+                "Check structured-output support and reasoning settings, or select another model.",
+            )
         return DoctorCheck(f"lm_studio_generate:{model}", True, "ok")
     except Exception as exc:
         return DoctorCheck(f"lm_studio_generate:{model}", False, str(exc))
@@ -157,6 +175,24 @@ def _check_ytdlp_browser_cookies(settings: Settings) -> DoctorCheck:
 
 def _check_media_download(settings: Settings) -> DoctorCheck:
     return DoctorCheck("media download", True, "enabled" if settings.media_download_enabled else "disabled")
+
+
+def _check_media_dependencies(settings: Settings) -> list[DoctorCheck]:
+    if not settings.media_download_enabled or settings.acceptance_mode == "data_api_only":
+        return []
+    # yt-dlp enables Deno by default; other runtimes must be selected explicitly.
+    runtime = settings.ytdlp_js_runtime or "deno"
+    executable = shutil.which(runtime)
+    return [
+        _check_import("yt-dlp-ejs", "yt_dlp_ejs"),
+        DoctorCheck(
+            "yt-dlp JavaScript runtime", executable is not None,
+            executable or (
+                f"{runtime} missing: install a supported Deno runtime, or install Node.js >=22 "
+                "and set YT_SUB_HUB_YTDLP_JS_RUNTIME=node"
+            ),
+        ),
+    ]
 
 
 def _check_acceptance_mode(settings: Settings, *, strict: bool) -> DoctorCheck:
@@ -305,6 +341,7 @@ def run_doctor(settings: Settings | None = None, strict: bool = False) -> Doctor
         _check_whisper_backend_selection(settings),
     ]
     checks.extend(_check_torch())
+    checks.extend(_check_media_dependencies(settings))
     checks.extend(
         [
             _check_ytdlp_proxy(settings),

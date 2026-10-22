@@ -5,6 +5,18 @@ import re
 from yt_sub_hub.models import Analysis
 
 
+# These technical names retain their Latin spelling in Russian notes. Ordinary
+# English words still require translation, including in short labels.
+TECHNICAL_ABBREVIATIONS = frozenset({"AI", "API", "APIs", "MCP", "LLM", "LLMs"})
+TECHNICAL_PRODUCT_NAMES = frozenset({
+    "ChatGPT", "OpenAI", "Claude", "Python", "Perplexity", "NotebookLM", "Cursor",
+})
+
+
+def is_technical_abbreviation(text: str) -> bool:
+    return text.strip() in TECHNICAL_ABBREVIATIONS | TECHNICAL_PRODUCT_NAMES
+
+
 BLOCKED_ENGLISH_PHRASES: tuple[str, ...] = (
     "Scientific summary",
     "The note is assembled",
@@ -94,7 +106,7 @@ def validate_ru_text_field(
         return issues
 
     if short_label and len(tokens) <= 2:
-        non_ru = [token for token in tokens if not contains_cyrillic(token)]
+        non_ru = [token for token in tokens if not contains_cyrillic(token) and not is_technical_abbreviation(token)]
         if non_ru:
             issues.append(f"{name} must use Cyrillic words")
         return issues

@@ -2,6 +2,11 @@
 
 Local-first service that turns one YouTube video into a scientific Markdown note, stores all source artifacts in a folder library, and writes extracted concepts, claims, and topics to Neo4j.
 
+For a new machine, follow the [self-hosting guide](docs/self-hosting.md).
+See the [2026-10-22 fixes and validation](docs/deployment-fixes-2026-10-22.md)
+for dependency versions and Google access requirements, and the
+[handoff validation](docs/handoff-validation-2026-10-22.md) for the live runtime checks.
+
 ## Runtime Shape
 
 - Python target: `3.11`
@@ -15,24 +20,21 @@ Local-first service that turns one YouTube video into a scientific Markdown note
 ## Quick Start
 
 ```bash
-uv venv --python 3.11 .venv311
-. .venv311/bin/activate
-uv pip install --python .venv311/bin/python -e ".[dev]"
+uv sync --locked --extra dev --python 3.11
+. .venv/bin/activate
 cp .env.example .env
-python - <<'PY'
-from pathlib import Path
-path = Path(".env")
-text = path.read_text()
-text = text.replace("YT_SUB_HUB_NEO4J_PASSWORD=change-me-in-.env", "YT_SUB_HUB_NEO4J_PASSWORD=local-dev-password")
-path.write_text(text)
-PY
+# Edit .env: set your own Neo4j password and installed LM Studio model IDs.
+# Install ffmpeg/ffprobe separately and make sure they are on PATH.
 docker compose up -d neo4j
 ```
 
-LM Studio must be running on `http://localhost:1234/v1`. The default model IDs in `.env.example` match the local models observed during setup:
+`uv sync --locked` reproduces the checked-in dependency versions. Avoid
+`uv pip install -e .` for a reproducible handoff because it does not use `uv.lock`.
 
-- `qwen/qwen3.6-35b-a3b`
-- `google/gemma-4-e4b`
+LM Studio must be running on `http://localhost:1234/v1`. The example uses
+`google/gemma-4-e4b` for both analysis roles and translation. Set the IDs to models
+installed on your machine. Translation is enabled because the strict queue/API
+quality gate requires Russian artifacts. Graph write errors fail processing by default.
 
 Check the runtime before processing:
 
@@ -46,11 +48,19 @@ Run one basic pipeline:
 yt-sub-hub process "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
-If LM Studio refuses to load the Qwen model because of local memory guardrails, use the loaded Gemma model explicitly for a working local smoke run:
+To fetch live metadata and transcripts for an existing video, use `process URL
+--refresh`. It regenerates dependent artifacts and preserves existing notes in
+timestamped backups. `--force` reanalyzes using fresh cached inputs when available.
+Raw inputs expire after 30 days. `yt-sub-hub cache-cleanup` previews expired raw
+files; add `--apply` to delete them. It retains notes, derived results, discovery
+data, media and Neo4j; see the self-hosting guide for retention limits.
+
+If another model times out or cannot finish structured JSON output, switch to a
+model that passes `doctor --strict` and a real processing run. For example:
 
 ```bash
 YT_SUB_HUB_QWEN_MODEL=google/gemma-4-e4b yt-sub-hub doctor --strict
-YT_SUB_HUB_QWEN_MODEL=google/gemma-4-e4b yt-sub-hub process "https://www.youtube.com/watch?v=w2uUux5abuY"
+YT_SUB_HUB_QWEN_MODEL=google/gemma-4-e4b yt-sub-hub process "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
 For longer videos on Gemma's smaller context window, keep `YT_SUB_HUB_MAX_PROMPT_CHARS=3500` or lower.
@@ -63,15 +73,47 @@ Keep Google OAuth files local. `token.json`, `client_secret*.json`, and `client_
 
 To use official YouTube Data API metadata/caption access:
 
-1. Create an OAuth installed-app client in Google Cloud.
-2. Download the client secret JSON into the project root or another private path.
-3. Run the local OAuth helper:
+1. Create your own Google Cloud project and enable **YouTube Data API v3**.
+2. Configure Google Auth Platform: audience, test users if in Testing, and the
+   `https://www.googleapis.com/auth/youtube.force-ssl` scope under Data Access.
+3. Create an OAuth client of type **Desktop app** and save its JSON as
+   `client_secrets.json` in the project root. The helper only searches the current directory.
+4. Run the local OAuth helper from the project root, on the machine with your browser:
 
 ```bash
-python youtube_auth_test.py
+python youtube_auth_test.py --timeout 1800
 ```
 
-The helper writes `token.json` by default. That file contains refresh credentials, so keep it private. To store it elsewhere, set `YT_SUB_HUB_YOUTUBE_API_TOKEN_FILE=/secure/path/token.json` in `.env`.
+The helper reads `YT_SUB_HUB_YOUTUBE_API_TOKEN_FILE` from `.env` and defaults to
+`token.json`. It checks granted scopes and atomically saves credentials with
+owner-only permissions on POSIX systems. Failed authorization leaves the existing
+file intact. You can also use the installed command and explicit paths:
+
+```bash
+yt-sub-hub-auth --client-secrets /secure/path/client_secrets.json --token-file /secure/path/token.json
+```
+
+`--no-browser` prints a local browser authorization URL; `--timeout` controls how
+long to wait for consent. Keep the helper running until credentials are saved.
+If the callback shows `localhost — ERR_CONNECTION_REFUSED`, start a new helper
+session and open its new URL on the same machine. If overriding the token path on the command line, set
+the same `YT_SUB_HUB_YOUTUBE_API_TOKEN_FILE` in `.env` for subsequent service calls.
+Each operator must authorize their own account; do not share tokens or browser cookies.
+The API client honors configured HTTP CONNECT/SOCKS proxies, including macOS
+system settings and bypass rules; TLS-to-proxy (`https://` proxy URLs) is unsupported.
+
+The scope is still supported, but official caption downloads require permission to
+edit the video. Public visibility alone is insufficient. External apps in Testing
+normally receive refresh tokens that expire after seven days. See the
+[self-hosting guide](docs/self-hosting.md) for sources, verification rules, quota
+limits, and troubleshooting.
+
+For public subtitles without audio/video download, explicitly select
+`--acceptance-mode full_processing` while leaving `YT_SUB_HUB_MEDIA_DOWNLOAD=disabled`.
+This allows the non-official public transcript provider. If no usable subtitles
+are available, processing fails; enabling media fallback remains a separate choice.
+The strict doctor checks the configured default acceptance profile and currently
+requires enabled media when the global profile is `full_processing`.
 
 To allow non-official media fallback for videos without usable captions, enable it explicitly:
 
@@ -86,6 +128,11 @@ YT_SUB_HUB_YTDLP_COOKIES_FILE=/secure/path/youtube-cookies.txt yt-sub-hub proces
 ```
 
 `YT_SUB_HUB_YTDLP_COOKIES_FROM_BROWSER=chrome` is still supported as an explicit fallback, but it reads browser cookies and can trigger macOS Keychain prompts.
+
+The locked `yt-dlp[default]` includes EJS challenge scripts. Media fallback also
+needs a supported JavaScript runtime on PATH: Deno is the yt-dlp default; to use
+Node.js >=22, set `YT_SUB_HUB_YTDLP_JS_RUNTIME=node`. `doctor` checks for the runtime
+and EJS when media fallback is enabled.
 
 ## Whisper Backend
 
@@ -197,13 +244,14 @@ library/
 
 ## Development Notes
 
-The checked-in `pyproject.toml` intentionally targets Python 3.11 because Whisper packages are not a good fit for the existing Python 3.14 virtualenv in this folder.
+The checked-in `pyproject.toml` targets Python 3.11. Use that version to reproduce
+the tested environment; support for other Python versions has not been established.
 
 Before publishing or opening a pull request, run:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 .venv311/bin/python -m pytest -q
-.venv311/bin/python -m compileall -q src tests
+PYTHONDONTWRITEBYTECODE=1 uv run --locked --extra dev python -m pytest -q
+uv run --locked --extra dev python -m compileall -q src tests
 ```
 
 Before committing, verify that only source, tests, docs, `pyproject.toml`, `uv.lock`, `.env.example`, and other safe project files are staged:

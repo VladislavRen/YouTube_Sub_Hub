@@ -196,7 +196,7 @@ Safety controls:
 Quota policy:
 
 - Default run budget: `--max-quota-units 900`.
-- `search.list`: 100 units per request.
+- `search.list`: отдельный счётчик вызовов поиска (лимит приложения 100 на run); не вычитается из общего бюджета. Остаток дневной квоты проекта приложение не вычисляет.
 - `videos.list` / `channels.list`: low-cost detail lookups.
 - Quota/rate errors fail discovery without mutating queue.
 

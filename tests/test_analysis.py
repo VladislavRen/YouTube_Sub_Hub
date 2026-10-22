@@ -61,6 +61,19 @@ def test_lm_studio_prompt_uses_chunked_transcript_for_long_inputs():
     assert "Chunk 2:" in prompt
 
 
+def test_short_analysis_prompt_preserves_segment_timestamps_and_language():
+    analyzer = LMStudioAnalyzer("http://localhost:1234/v1", "key", "qwen", "gemma")
+    metadata = VideoMetadata(video_id="abc123", canonical_url="https://youtu.be/abc123", title="Talk")
+    transcript = Transcript(
+        video_id="abc123", source="youtube", language="ru",
+        segments=[TranscriptSegment(12, 3, "Начало"), TranscriptSegment(187, 4, "Пример")],
+    )
+    prompt = analyzer._prompt(metadata, transcript)
+    assert "[12s] Начало" in prompt
+    assert "[187s] Пример" in prompt
+    assert "Transcript language: ru" in prompt
+
+
 def test_lm_studio_prompt_keeps_user_prompt_under_budget():
     analyzer = LMStudioAnalyzer("http://localhost:1234/v1", "key", "qwen", "gemma", max_prompt_chars=500)
     metadata = VideoMetadata(video_id="abc123", canonical_url="https://youtu.be/abc123", title="Talk")

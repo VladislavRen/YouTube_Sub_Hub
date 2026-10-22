@@ -178,6 +178,19 @@ def test_whisper_cpp_empty_stdout_fallback_fails_instead_of_returning_empty_tran
         raise AssertionError("empty whisper.cpp stdout fallback must fail")
 
 
+def test_whisper_cpp_reads_language_from_native_result_object(tmp_path, monkeypatch):
+    def fake_run(args, **kwargs):
+        Path(args[args.index("-of") + 1]).with_suffix(".json").write_text(json.dumps({
+            "result": {"language": "en"},
+            "transcription": [{"offsets": {"from": 0, "to": 1000}, "text": "Hello"}],
+        }))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    bundle = WhisperCppBackend("whisper-cli", "base.bin").transcribe(tmp_path / "audio.wav")
+    assert bundle.normalized.language == "en"
+
+
 def test_whisper_resource_lock_distinguishes_cpu_and_accelerated_backends():
     assert whisper_resource_lock("openai-whisper-cpu") == "whisper_cpu"
     assert whisper_resource_lock("openai-whisper-mps") == "whisper_accelerated"

@@ -7,6 +7,16 @@ tags: [architecture, research_enrichment, neo4j, quality_gate]
 
 # Research Enrichment Layer for YouTube Sub Hub
 
+## Implementation note — 2026-10-22
+
+The current deterministic MVP retrieves source excerpts and validates their URLs and
+quotes. It does not evaluate semantic support or contradictions. Such context is
+explicitly `accepted=false`, `claim_support=not_assessed`, including in graph nodes;
+`summary_ru` remains null until an actual Russian summary exists. Future synthesis
+stages described below remain design goals, not a claim of implemented fact checking.
+Discovery/sync require a completed reviewed run with matching artifact and upstream
+core hashes. See [live validation](optional-modes-validation-2026-10-22.md).
+
 ## Decision Summary
 
 Add `research_enrichment` as an optional post-core layer. It runs only after a video already has valid RU artifacts (`note.md`, `analysis.ru.json`, `review/ru_artifact_review.json`) and stores its own Markdown, JSON, review, and graph artifacts under `library/videos/<video_id>/research/`.

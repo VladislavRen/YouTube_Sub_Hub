@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import multiprocessing
-import queue
 import subprocess
 import threading
 import time
@@ -249,80 +248,43 @@ def _run_chunks_in_processes(
     run_timeout_seconds: float,
     run_started: float,
 ) -> tuple[list[dict[str, Any]], list[int]]:
+    if not payloads:
+        return [], []
     ctx = multiprocessing.get_context("spawn")
-    result_queue = ctx.Queue()
     transcript_payload = transcript.to_dict()
     settings_payload = _benchmark_settings_payload(settings)
-    max_workers = max(1, int(concurrency))
     deadline = run_started + max(0.001, float(run_timeout_seconds))
-    pending = list(payloads)
-    active: dict[int, tuple[multiprocessing.Process, dict[str, Any], float]] = {}
     completed_indexes: set[int] = set()
     results: list[dict[str, Any]] = []
-
-    def launch_available() -> None:
-        while pending and len(active) < max_workers and time.perf_counter() < deadline:
-            payload = pending.pop(0)
-            chunk_index = int(payload["chunk_index"])
-            launched_at = time.perf_counter()
-            process = ctx.Process(
-                target=translate_chunk_worker,
-                args=(settings_payload, transcript_payload, target, payload, timeout_seconds, result_queue),
-            )
-            process.daemon = True
-            process.start()
-            active[chunk_index] = (process, payload, launched_at)
-
+    # Reuse workers: repeatedly importing the SDK for each tiny chunk otherwise
+    # dominates both the deadline and the measured concurrency improvement.
+    pool = ctx.Pool(processes=min(len(payloads), max(1, int(concurrency))))
     try:
-        launch_available()
-        while len(completed_indexes) < len(payloads) and time.perf_counter() < deadline:
-            drained = False
-            while True:
-                try:
-                    result = result_queue.get_nowait()
-                except queue.Empty:
-                    break
-                drained = True
-                chunk_index = int(result["chunk_index"])
-                if chunk_index in completed_indexes:
-                    continue
+        tasks = ((settings_payload, transcript_payload, target, payload, timeout_seconds) for payload in payloads)
+        pending = pool.imap_unordered(translate_chunk_task, tasks, chunksize=1)
+        while len(completed_indexes) < len(payloads):
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            try:
+                result = pending.next(timeout=min(0.1, remaining))
+            except multiprocessing.TimeoutError:
+                continue
+            except StopIteration:
+                break
+            chunk_index = int(result["chunk_index"])
+            if chunk_index not in completed_indexes:
                 completed_indexes.add(chunk_index)
                 results.append(result)
-                process_info = active.pop(chunk_index, None)
-                if process_info is not None:
-                    process_info[0].join(timeout=0.2)
-            for chunk_index, (process, payload, launched_at) in list(active.items()):
-                if process.is_alive():
-                    continue
-                process.join(timeout=0.2)
-                if chunk_index not in completed_indexes:
-                    completed_indexes.add(chunk_index)
-                    active.pop(chunk_index, None)
-                    results.append(
-                        _chunk_process_error_result(
-                            transcript,
-                            payload,
-                            launched_at,
-                            f"worker process exited before returning result (exitcode={process.exitcode})",
-                        )
-                    )
-            launch_available()
-            if not drained:
-                time.sleep(0.02)
     finally:
-        timed_out_payloads = [payload for payload in payloads if int(payload["chunk_index"]) not in completed_indexes]
-        timeout_finished_at = time.perf_counter()
-        for process, _payload, _launched_at in list(active.values()):
-            if process.is_alive():
-                process.terminate()
-        for process, _payload, _launched_at in list(active.values()):
-            process.join(timeout=1)
-        for payload in timed_out_payloads:
-            results.append(_chunk_timeout_result(transcript, payload, run_started, timeout_finished_at))
-        result_queue.close()
-        result_queue.join_thread()
-    timed_out_chunk_indexes = sorted(int(payload["chunk_index"]) for payload in payloads if int(payload["chunk_index"]) not in completed_indexes)
-    return results, timed_out_chunk_indexes
+        # terminate also kills a provider stuck outside its HTTP timeout;
+        # closing a pool alone would wait for the hung request indefinitely.
+        pool.terminate()
+        pool.join()
+    finished_at = time.perf_counter()
+    timed_out_payloads = [payload for payload in payloads if int(payload["chunk_index"]) not in completed_indexes]
+    results.extend(_chunk_timeout_result(transcript, payload, run_started, finished_at) for payload in timed_out_payloads)
+    return results, sorted(int(payload["chunk_index"]) for payload in timed_out_payloads)
 
 
 def _resolve_run_timeout_seconds(
@@ -360,21 +322,14 @@ def _transcript_from_payload(data: dict[str, Any]) -> Transcript:
     )
 
 
-def translate_chunk_worker(
-    settings_payload: dict[str, Any],
-    transcript_payload: dict[str, Any],
-    target: str,
-    payload: dict[str, Any],
-    timeout_seconds: float,
-    result_queue: Any,
-) -> None:
+def translate_chunk_task(task: tuple) -> dict[str, Any]:
+    settings_payload, transcript_payload, target, payload, timeout_seconds = task
     transcript = _transcript_from_payload(transcript_payload)
     settings = SimpleNamespace(**settings_payload)
     try:
-        result = _translate_chunk(transcript, settings, target, payload, timeout_seconds)
-    except Exception as exc:  # noqa: BLE001 - parent needs a chunk-shaped worker failure.
-        result = _chunk_error_result(transcript, payload, type(exc).__name__, _short_error(str(exc)))
-    result_queue.put(result)
+        return _translate_chunk(transcript, settings, target, payload, timeout_seconds)
+    except Exception as exc:  # Parent needs a chunk-shaped worker failure.
+        return _chunk_error_result(transcript, payload, type(exc).__name__, _short_error(str(exc)))
 
 
 def _chunk_timeout_result(
@@ -390,17 +345,6 @@ def _chunk_timeout_result(
         "benchmark run timed out before chunk completed",
     )
     result["latency_seconds"] = round(max(0.0, finished_at - started_at), 3)
-    return result
-
-
-def _chunk_process_error_result(
-    transcript: Transcript,
-    payload: dict[str, Any],
-    started_at: float,
-    message: str,
-) -> dict[str, Any]:
-    result = _chunk_error_result(transcript, payload, "BenchmarkWorkerError", message)
-    result["latency_seconds"] = round(max(0.0, time.perf_counter() - started_at), 3)
     return result
 
 

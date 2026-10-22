@@ -94,7 +94,9 @@ class _TranslationStubHandler(BaseHTTPRequestHandler):
                 content = '{"segments": []}'
             else:
                 if self.state.mode == "speedup":
-                    time.sleep(0.03 if active <= 2 else 1.0)
+                    # Make useful work dominate spawned-worker import overhead;
+                    # 30ms samples made the 20% speedup assertion CPU-load dependent.
+                    time.sleep(0.10 if active <= 2 else 1.0)
                 elif self.state.mode == "hang_parallel" and active > 1:
                     time.sleep(30)
                     return

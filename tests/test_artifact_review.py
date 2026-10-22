@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+import pytest
 
 from yt_sub_hub.artifact_review import analysis_data_hash, review_ru_artifacts, transcript_hash
 from yt_sub_hub.config import get_settings
@@ -490,3 +491,41 @@ def test_live_like_pl6ziily1me_uses_chunk_coverage(tmp_path):
     assert report.coverage["chunk_artifacts_valid"] == 4
     assert report.coverage["chunk_artifacts_stale"] == 2
     assert not any(issue.severity == "hard" for issue in report.issues)
+
+
+@pytest.mark.parametrize("enable_translation", [True, False])
+def test_visual_graph_merge_keeps_core_review_hash_current(tmp_path, enable_translation):
+    from yt_sub_hub.artifact_review import canonical_hash, load_ru_artifact_review
+    from yt_sub_hub.visual import VisualAnalysisService
+    store = LibraryStore(tmp_path)
+    _write_review_video(store, source_count=6, ru_count=6)
+    settings = replace(get_settings(env_file=tmp_path / 'missing.env'), library_dir=tmp_path,
+        enable_translation=enable_translation, target_language='ru' if enable_translation else 'en', visual_best_effort=False)
+    review_ru_artifacts('abc123def45', store, settings)
+    store.save_visual_frame('abc123def45', '000010', raw={}, normalized={
+        'timestamp_seconds': 10, 'summary': 'Русское наблюдение на экране.', 'language': 'ru',
+        'visible_objects': ['Таблица'], 'confidence': 0.7,
+    })
+    VisualAnalysisService(settings, store)._merge_graph_best_effort('abc123def45')
+    review = load_ru_artifact_review(store, 'abc123def45')
+    assert review['hashes']['graph_hash'] == canonical_hash(store.load_graph_extraction('abc123def45'))
+
+
+def test_failed_visual_merge_restores_core_graph_and_review(tmp_path, monkeypatch):
+    from yt_sub_hub.visual import VisualAnalysisService
+    store = LibraryStore(tmp_path)
+    _write_review_video(store, source_count=6, ru_count=6)
+    settings = replace(get_settings(env_file=tmp_path / 'missing.env'), library_dir=tmp_path,
+        enable_translation=True, target_language='ru', visual_best_effort=True)
+    review_ru_artifacts('abc123def45', store, settings)
+    paths = store.artifact_paths('abc123def45')
+    before = paths.graph_extraction.read_bytes(), paths.ru_artifact_review.read_bytes()
+    store.save_visual_frame('abc123def45', '000010', raw={}, normalized={
+        'timestamp_seconds': 10, 'summary': 'Русское наблюдение.', 'language': 'ru',
+    })
+    def fail_review(*args):
+        paths.ru_artifact_review.write_text('{"status":"failed"}')
+        raise RuntimeError('review unavailable')
+    monkeypatch.setattr('yt_sub_hub.artifact_review.review_ru_artifacts', fail_review)
+    VisualAnalysisService(settings, store)._merge_graph_best_effort('abc123def45')
+    assert (paths.graph_extraction.read_bytes(), paths.ru_artifact_review.read_bytes()) == before

@@ -208,11 +208,14 @@ class DuckDuckGoSearchProvider:
     def search(self, query: str, limit: int) -> list[SearchResult]:
         try:
             from ddgs import DDGS
+            from ddgs.exceptions import DDGSException
         except ImportError as exc:
             raise RuntimeError("ddgs package is required for DuckDuckGo research search") from exc
         try:
             rows = list(DDGS().text(query, max_results=max(1, int(limit))))
         except Exception as exc:
+            if type(exc) is DDGSException and str(exc) == "No results found.":
+                return []
             raise RuntimeError(f"DuckDuckGo search failed for query {query!r}: {exc}") from exc
         results: list[SearchResult] = []
         for index, row in enumerate(rows, start=1):
@@ -392,7 +395,9 @@ def validate_fetch_url(url: str, *, resolve_host: bool = True) -> SafeUrlResult:
             address = info[-1][0]
             if _unsafe_ip_literal(address):
                 return SafeUrlResult(False, "", "blocked host resolving to private or reserved IP address", hostname)
-    return SafeUrlResult(True, canonicalize_url(url), "", hostname)
+    # Deduplication keys must not rewrite fetch/redirect targets: servers may
+    # require www or a trailing slash and redirect back to that exact URL.
+    return SafeUrlResult(True, urlunsplit((parts.scheme, parts.netloc, parts.path or "/", parts.query, "")), "", hostname)
 
 
 def _unsafe_ip_literal(hostname: str) -> bool:
@@ -516,9 +521,10 @@ def review_research_enrichment(report: ResearchReport, fetched_sources: list[Fet
     valid_citations = 0
     seen_claims: set[str] = set()
     for claim in report.claims:
-        if normalize_text(claim.text) in seen_claims:
+        finding_key = claim.claim_id if claim.finding_type == "unverified_context" else normalize_text(claim.text)
+        if finding_key in seen_claims:
             issues.append(_warning("duplicate_finding", "findings.ru.json", f"duplicate finding: {claim.text[:80]}"))
-        seen_claims.add(normalize_text(claim.text))
+        seen_claims.add(finding_key)
         if not claim.citations:
             issues.append(_hard("missing_citation", "findings.ru.json", "every finding must include at least one citation"))
             continue
@@ -580,7 +586,7 @@ def render_research_report(report: ResearchReport, fetched_sources: list[Fetched
         "",
         report.external_context or "Внешний контекст построен только на скачанных и проверенных источниках.",
         "",
-        "## Подтверждения",
+        "## Выдержки и контекст",
         "",
     ]
     for claim in report.claims:
@@ -598,7 +604,7 @@ def render_research_report(report: ResearchReport, fetched_sources: list[Fetched
     if report.contradictions:
         lines.extend(f"- {item}" for item in report.contradictions)
     else:
-        lines.append("- Явные противоречия не выявлены в принятых источниках.")
+        lines.append("- Смысловая поддержка тезисов и противоречия автоматически не оценивались.")
     lines.extend(["", "## Новые понятия", ""])
     if report.new_concepts:
         lines.extend(f"- {item}" for item in report.new_concepts)
@@ -621,6 +627,7 @@ def run_video_research(
 ) -> dict[str, Any]:
     research_dir = research_dir_for(store, video_id)
     research_dir.mkdir(parents=True, exist_ok=True)
+    (research_dir / "review" / "research_artifact_review.json").unlink(missing_ok=True)
     _write_json(research_dir / "status.json", {"video_id": video_id, "status": ResearchStatus.RUNNING.value, "updated_at": utc_now()})
     try:
         _require_core_ready(store, video_id)
@@ -631,6 +638,7 @@ def run_video_research(
         analysis = parse_analysis_response(analysis_data)
         note_path = store.note_path(video_id)
         plan = _build_research_plan(video_id, note_path, store.artifact_paths(video_id).analysis_ru, analysis_data)
+        plan["limits"]["max_sources"] = max_sources
         queries = _build_queries(analysis)
         _write_json(research_dir / "research_plan.json", plan)
         _write_json(research_dir / "queries.json", [asdict(query) for query in queries])
@@ -681,11 +689,11 @@ def run_video_research(
         if not usable_sources:
             raise RuntimeError("research source fetch produced no usable sources")
 
-        source_summaries = _build_source_summaries(usable_sources, queries)
+        source_summaries = _build_source_summaries(usable_sources, queries, normalized_results)
         _write_json(research_dir / "source_summaries.json", source_summaries)
         report = _build_report(metadata.title, analysis_data, usable_sources)
         graph = _build_research_graph(video_id, plan["research_run_id"], report, usable_sources)
-        review = review_research_enrichment(report, usable_sources, graph)
+        review = review_research_enrichment(report, fetched_sources, graph)
         if review.status == "failed":
             raise ResearchValidationError("research artifact review failed: " + "; ".join(issue.message for issue in review.issues))
         markdown = render_research_report(report, usable_sources)
@@ -694,9 +702,12 @@ def run_video_research(
         _write_json(research_dir / "research_graph.json", graph)
         review_dir = research_dir / "review"
         review_dir.mkdir(parents=True, exist_ok=True)
-        _write_json(review_dir / "research_artifact_review.json", review.to_dict())
+        review_payload = {**review.to_dict(), "research_run_id": plan["research_run_id"],
+                          "scope": "source_and_quote_validation", "claim_support": "not_assessed",
+                          "artifact_hashes": _research_artifact_hashes(research_dir)}
+        _write_json(review_dir / "research_artifact_review.json", review_payload)
         status = ResearchStatus.COMPLETED.value if review.status == "passed" else ResearchStatus.COMPLETED_WITH_WARNING.value
-        status_payload = {"video_id": video_id, "status": status, "review_status": review.status, "updated_at": utc_now()}
+        status_payload = {"video_id": video_id, "status": status, "review_status": review.status, "research_run_id": plan["research_run_id"], "updated_at": utc_now()}
         _write_json(research_dir / "status.json", status_payload)
         return build_research_payload(store, video_id)
     except Exception as exc:
@@ -740,6 +751,7 @@ def sync_research_graph_to_neo4j(store: LibraryStore, video_id: str, *, settings
     review = load_research_review(store, video_id)
     if review.get("status") != "passed":
         raise ResearchValidationError("neo4j research sync requires research_artifact_review status passed")
+    require_current_research_run(store, video_id)
     path = research_dir_for(store, video_id) / "research_graph.json"
     if not path.exists():
         raise FileNotFoundError(path)
@@ -783,7 +795,7 @@ def build_channel_research_summary(store: LibraryStore, channel_id: str) -> dict
         if not findings_path.exists():
             continue
         for finding in json.loads(findings_path.read_text(encoding="utf-8")):
-            if isinstance(finding, dict):
+            if isinstance(finding, dict) and finding.get("accepted") is True:
                 findings.append({"video_id": video_id, **finding})
     research_dir = channel_dir / "research"
     research_dir.mkdir(parents=True, exist_ok=True)
@@ -921,8 +933,9 @@ def _build_research_plan(video_id: str, note_path: Path, analysis_path: Path, an
 
 
 def _build_queries(analysis: Any) -> list[ResearchQuery]:
+    topic = " ".join(analysis.tags[:2]) or analysis.cleaned_title
     values = [claim.text for claim in analysis.claims[:3]]
-    values.extend(concept.name for concept in analysis.concepts[:3])
+    values.extend(f"{topic} {concept.name}".strip() for concept in analysis.concepts[:3])
     values.extend(analysis.open_questions[:2])
     queries: list[ResearchQuery] = []
     for index, value in enumerate(values, start=1):
@@ -941,63 +954,52 @@ def _build_queries(analysis: Any) -> list[ResearchQuery]:
     return queries
 
 
-def _build_source_summaries(sources: list[FetchedSource], queries: list[ResearchQuery]) -> list[dict[str, Any]]:
-    query_ids = [query.query_id for query in queries]
+def _build_source_summaries(
+    sources: list[FetchedSource], queries: list[ResearchQuery], results: list[SearchResult] | None = None,
+) -> list[dict[str, Any]]:
+    query_ids = {query.query_id for query in queries}
+    results_by_id = {result.result_id: result for result in results or []}
     return [
         {
             "source_id": source.source_id,
-            "relevant_query_ids": query_ids[:3],
-            "summary_ru": _first_sentence(source.text) or source.title,
-            "key_points": [_first_sentence(source.text) or source.title],
+            "relevant_query_ids": sorted({results_by_id[result_id].query_id for result_id in source.result_ids
+                                          if result_id in results_by_id and results_by_id[result_id].query_id in query_ids}),
+            "summary_ru": None,
+            "summary_status": "not_generated",
+            "excerpt_original": _first_sentence(source.text) or source.title,
+            "language": "unknown",
+            "key_points": [],
             "candidate_quotes": [_first_quote(source.text)],
             "chunk_refs": [{"chunk_id": f"{source.source_id}:000", "start_char": 0, "end_char": min(len(source.text), 500)}],
-            "confidence": 0.8,
+            "confidence": None,
         }
         for source in sources
     ]
 
 
 def _build_report(title: str, analysis_data: dict[str, Any], sources: list[FetchedSource]) -> ResearchReport:
-    claims_data = [item for item in analysis_data.get("claims") or [] if isinstance(item, dict)]
+    # Matching a quote proves its origin, not that it supports a video claim.
+    # The deterministic MVP provides source excerpts for human comparison only.
     claims: list[ResearchClaim] = []
-    for index, item in enumerate(claims_data[: max(1, min(3, len(claims_data)))], start=1):
-        source = sources[(index - 1) % len(sources)]
-        quote = _best_quote_for_claim(str(item.get("text") or ""), source.text)
+    topic = " ".join(str(item.get("name") or "") for item in analysis_data.get("concepts") or [] if isinstance(item, dict))
+    for source in sources:
+        quote = _best_quote_for_claim(topic, source.text)
         validation = validate_quote(quote, source)
-        claims.append(
-            ResearchClaim(
-                text=str(item.get("text") or "Внешний источник добавляет контекст к видео."),
-                finding_type="context",
-                citations=[
-                    Citation(
-                        source_id=source.source_id,
-                        url=source.url,
-                        quote=quote,
-                        quote_start_char=validation.quote_start_char,
-                        quote_end_char=validation.quote_end_char,
-                        quote_validation=validation.status,
-                    )
-                ],
-                confidence=0.8,
-            )
-        )
-    if not claims:
-        source = sources[0]
-        quote = _first_quote(source.text)
-        claims.append(
-            ResearchClaim(
-                text="Внешний источник добавляет проверяемый контекст к видео.",
-                citations=[Citation(source_id=source.source_id, url=source.url, quote=quote, quote_validation=validate_quote(quote, source).status)],
-            )
-        )
+        claims.append(ResearchClaim(
+            claim_id=_stable_id("source-context", source.url, length=16),
+            text=f"Источник «{source.title}»: выдержка для сопоставления с видео; поддержка тезисов не оценивалась.",
+            finding_type="unverified_context",
+            citations=[Citation(source_id=source.source_id, url=source.url, quote=quote,
+                                quote_start_char=validation.quote_start_char, quote_end_char=validation.quote_end_char,
+                                quote_validation=validation.status)],
+            confidence=0.0,
+            accepted=False,
+        ))
     return ResearchReport(
-        title=title,
-        claims=claims,
-        summary=f"Сформирован внешний контекст по {len(sources)} проверенным источникам.",
-        external_context="Все выводы ниже используют только URL из поискового и fetch-слоев.",
-        new_concepts=[str(item.get("name")) for item in analysis_data.get("concepts") or [] if isinstance(item, dict)][:3],
-        confidence=0.8,
-        source_count=len(sources),
+        title=title, claims=claims,
+        summary=f"Собраны выдержки из {len(sources)} скачанных источников. Проверено происхождение цитат.",
+        external_context="Это поисковый контекст для ручной проверки. Он не подтверждает и не опровергает тезисы видео.",
+        confidence=0.0, source_count=len(sources),
     )
 
 
@@ -1015,6 +1017,8 @@ def _build_research_graph(video_id: str, research_run_id: str, report: ResearchR
             "source_video_id": video_id,
             "research_run_id": research_run_id,
             "text": claim.text,
+            "accepted": claim.accepted,
+            "claim_support": "not_assessed" if not claim.accepted else "provided",
             "confidence": claim.confidence,
             "language": "ru",
         }
@@ -1028,8 +1032,8 @@ def _build_research_graph(video_id: str, research_run_id: str, report: ResearchR
             source = sources_by_url.get(citation.url)
             if source is None:
                 continue
-            source_node = f"external_source:{source.source_id}"
-            citation_node = f"citation:{citation.citation_id}"
+            source_node = f"external_source:{video_id}:{research_run_id}:{source.source_id}"
+            citation_node = f"citation:{video_id}:{research_run_id}:{citation.citation_id}"
             nodes[source_node] = {
                 "id": source_node,
                 "label": "ExternalSource",
@@ -1094,6 +1098,44 @@ def _research_rel(
     }
 
 
+RESEARCH_REVIEWED_ARTIFACTS = ("research_plan.json", "findings.ru.json", "source_summaries.json", "research_graph.json", "research_report.md")
+
+
+def _research_artifact_hashes(root: Path) -> dict[str, str]:
+    return {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in RESEARCH_REVIEWED_ARTIFACTS}
+
+
+def require_current_research_run(store: LibraryStore, video_id: str) -> str:
+    root = research_dir_for(store, video_id)
+    try:
+        status = _read_json(root / "status.json")
+        plan = _read_json(root / "research_plan.json")
+        review = _read_json(root / "review" / "research_artifact_review.json")
+    except (OSError, ValueError) as exc:
+        raise ResearchValidationError("research requires a completed, reviewed run; rerun research-video") from exc
+    if status.get("status") not in {"completed", "completed_with_warning"}:
+        raise ResearchValidationError("research requires a completed run; rerun research-video")
+    run_id = plan.get("research_run_id")
+    if not run_id or status.get("research_run_id") != run_id or review.get("research_run_id") != run_id:
+        raise ResearchValidationError("research run IDs do not match; rerun research-video")
+    if review.get("status") != "passed":
+        raise ResearchValidationError("research_artifact_review status passed is required")
+    try:
+        current_note_hash = text_hash(store.note_path(video_id).read_text(encoding="utf-8"))
+        current_analysis_hash = text_hash(json.dumps(_read_json(store.artifact_paths(video_id).analysis_ru), ensure_ascii=False, sort_keys=True))
+    except (OSError, ValueError) as exc:
+        raise ResearchValidationError("research core artifacts are missing; rerun core and research-video") from exc
+    if plan.get("source_note_hash") != current_note_hash or plan.get("source_analysis_hash") != current_analysis_hash:
+        raise ResearchValidationError("research core artifacts changed; rerun research-video")
+    try:
+        current_hashes = _research_artifact_hashes(root)
+    except OSError as exc:
+        raise ResearchValidationError("research artifacts are missing; rerun research-video") from exc
+    if review.get("artifact_hashes") != current_hashes:
+        raise ResearchValidationError("research artifacts changed since review; rerun research-video")
+    return str(run_id)
+
+
 def _require_core_ready(store: LibraryStore, video_id: str) -> None:
     paths = store.artifact_paths(video_id)
     missing = [path.name for path in [paths.note, paths.analysis_ru, paths.ru_artifact_review] if not path.exists()]
@@ -1133,6 +1175,7 @@ def _claim_payload(claim: ResearchClaim, sources: list[FetchedSource]) -> dict[s
         "citations": citations,
         "confidence": claim.confidence,
         "accepted": claim.accepted,
+        "claim_support": "not_assessed" if not claim.accepted else "provided",
     }
 
 
@@ -1163,14 +1206,14 @@ def _first_quote(text: str) -> str:
 
 def _best_quote_for_claim(claim: str, source_text: str) -> str:
     source = source_text or ""
-    claim_words = [word for word in normalize_text(claim).split() if len(word) > 4]
+    claim_words = [word for word in normalize_text(claim).split() if len(word) > 2]
     sentences = re.split(r"(?<=[.!?])\s+", source)
     best = ""
     best_score = -1
     for sentence in sentences:
         normalized = normalize_text(sentence)
         score = sum(1 for word in claim_words if word in normalized)
-        if score > best_score and len(normalized) > 10:
+        if score > best_score and 20 <= len(sentence.strip()) <= 500:
             best = sentence.strip()
             best_score = score
     return best[:500] if best else _first_quote(source)

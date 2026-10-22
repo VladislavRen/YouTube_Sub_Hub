@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import fcntl
 import json
+import os
+import re
 import sqlite3
+import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,6 +47,9 @@ class VisualArtifactPaths:
 
 
 class LibraryStore:
+    RAW_CACHE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+    RAW_CACHE_FILENAMES = ("metadata.json", "transcript.raw.json", "transcript.normalized.json")
+
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)
 
@@ -133,15 +141,116 @@ class LibraryStore:
 
     def has_completed_video(self, video_id: str) -> bool:
         paths = self.artifact_paths(video_id)
-        return all(
-            path.exists()
-            for path in [
-                paths.note,
-                paths.metadata,
-                paths.normalized_transcript,
-                paths.analysis,
-            ]
+        return (
+            self.derived_cache_valid(video_id, paths.note)
+            and self.load_video_metadata(video_id) is not None
+            and self.load_normalized_transcript(video_id) is not None
+            and self.load_analysis(video_id) is not None
         )
+
+    def _cache_state(self, video_id: str) -> dict[str, int]:
+        path = self.video_dir(video_id) / "source_cache.json"
+        return self._read_json(path) if path.exists() else {}
+
+    @contextmanager
+    def video_lock(self, video_id: str, *, shared: bool = False):
+        """Coordinate raw-input refresh/cleanup with direct and staged writers on this host."""
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", video_id):
+            raise ValueError("Invalid video id for cache lock")
+        directory = self.root / ".cache-locks"
+        if directory.is_symlink():
+            raise ValueError("Cache lock directory must not be a symlink")
+        directory.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(directory / f"{video_id}.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            try:
+                fcntl.flock(descriptor, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError(f"Video {video_id} is busy; retry after the active worker finishes") from exc
+            yield
+        finally:
+            os.close(descriptor)
+
+    def raw_cache_valid(self, video_id: str, path: Path) -> bool:
+        if not path.is_file() or path.is_symlink():
+            return False
+        stat = path.stat()
+        return (
+            stat.st_mtime > time.time() - self.RAW_CACHE_MAX_AGE_SECONDS
+            and stat.st_mtime_ns >= self._cache_state(video_id).get("inputs_invalidated_at_ns", 0)
+        )
+
+    def has_expired_inputs(self, video_id: str) -> bool:
+        return any(
+            path.exists() and not self.raw_cache_valid(video_id, path)
+            for path in (self.video_dir(video_id) / name for name in self.RAW_CACHE_FILENAMES)
+        )
+
+    def derived_cache_valid(self, video_id: str, path: Path) -> bool:
+        return (
+            path.is_file()
+            and not self.has_expired_inputs(video_id)
+            and path.stat().st_mtime_ns >= self._cache_state(video_id).get("derived_invalidated_at_ns", 0)
+        )
+
+    def invalidate_source_cache(self, video_id: str, *, refresh_inputs: bool = False) -> None:
+        """Persist invalidation before network work so failed refreshes stay invalid after restart."""
+        directory = self.video_dir(video_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        state = self._cache_state(video_id)
+        now = time.time_ns()
+        state["derived_invalidated_at_ns"] = now
+        if refresh_inputs:
+            state["inputs_invalidated_at_ns"] = now
+        self._write_json(directory / "source_cache.json", state)
+        # Notes can contain user edits. Preserve them before a subsequent render replaces them.
+        for name in ("note", "note.source"):
+            note = directory / f"{name}.md"
+            if note.is_file() and not note.is_symlink():
+                (directory / f"{name}.before-refresh.{now}.md").write_bytes(note.read_bytes())
+
+    def save_source_metadata(self, metadata: VideoMetadata) -> None:
+        paths = self.artifact_paths(metadata.video_id)
+        paths.video_dir.mkdir(parents=True, exist_ok=True)
+        self._write_json(paths.metadata, metadata.to_dict())
+
+    def save_source_transcript(self, video_id: str, raw: Any, normalized: Transcript) -> None:
+        paths = self.artifact_paths(video_id)
+        paths.video_dir.mkdir(parents=True, exist_ok=True)
+        self._write_json(paths.raw_transcript, raw)
+        self._write_json(paths.normalized_transcript, normalized.to_dict())
+
+    def cleanup_expired_raw_cache(self, *, apply: bool = False) -> list[Path]:
+        """Only direct, regular raw-input files under validated video directories are candidates."""
+        videos = self.root / "videos"
+        if not videos.is_dir() or videos.is_symlink():
+            return []
+        candidates: list[Path] = []
+        cutoff = time.time() - self.RAW_CACHE_MAX_AGE_SECONDS
+        for directory in sorted(videos.iterdir()):
+            if directory.is_symlink() or not directory.is_dir() or not re.fullmatch(r"[A-Za-z0-9_-]{11}", directory.name):
+                continue
+            expired = [
+                directory / name for name in self.RAW_CACHE_FILENAMES
+                if (directory / name).is_file() and not (directory / name).is_symlink()
+                and (directory / name).stat().st_mtime <= cutoff
+            ]
+            if apply and expired:
+                with self.video_lock(directory.name):
+                    if directory.is_symlink() or videos.is_symlink():
+                        continue
+                    self.invalidate_source_cache(directory.name)
+                    for path in expired:
+                        # Recheck immediately before unlinking; fresh writes must survive a cleanup run.
+                        if path.is_file() and not path.is_symlink() and path.stat().st_mtime <= cutoff:
+                            path.unlink()
+            candidates.extend(expired)
+        return candidates
+
+    def _write_source_if_changed(self, path: Path, data: Any) -> None:
+        # Reanalysis must not renew the acquisition date of a cached source.
+        if not path.exists() or self._read_json(path) != data:
+            self._write_json(path, data)
 
     def save_video_artifacts(
         self,
@@ -156,10 +265,10 @@ class LibraryStore:
         video_dir.mkdir(parents=True, exist_ok=True)
         paths = self.artifact_paths(metadata.video_id)
         paths.note.write_text(markdown, encoding="utf-8")
-        self._write_json(paths.metadata, metadata.to_dict())
+        self._write_source_if_changed(paths.metadata, metadata.to_dict())
         raw_data = raw_transcript.to_dict() if hasattr(raw_transcript, "to_dict") else raw_transcript
-        self._write_json(paths.raw_transcript, raw_data)
-        self._write_json(paths.normalized_transcript, normalized_transcript.to_dict())
+        self._write_source_if_changed(paths.raw_transcript, raw_data)
+        self._write_source_if_changed(paths.normalized_transcript, normalized_transcript.to_dict())
         self._write_json(paths.analysis, analysis.to_dict())
         return paths
 
@@ -174,7 +283,7 @@ class LibraryStore:
 
     def load_translated_transcript(self, video_id: str, language: str = "ru") -> Transcript | None:
         path = self.video_dir(video_id) / f"transcript.{language}.json"
-        if not path.exists():
+        if not self.derived_cache_valid(video_id, path):
             return None
         return self._load_transcript_path(path)
 
@@ -212,25 +321,26 @@ class LibraryStore:
 
     def load_video_metadata(self, video_id: str) -> VideoMetadata | None:
         path = self.video_dir(video_id) / "metadata.json"
-        if not path.exists():
+        if not self.raw_cache_valid(video_id, path):
             return None
         return VideoMetadata(**self._read_json(path))
 
     def load_raw_transcript(self, video_id: str) -> Any | None:
         path = self.video_dir(video_id) / "transcript.raw.json"
-        if not path.exists():
+        if not self.raw_cache_valid(video_id, path):
             return None
         return self._read_json(path)
 
     def load_normalized_transcript(self, video_id: str) -> Transcript | None:
         path = self.video_dir(video_id) / "transcript.normalized.json"
-        if not path.exists():
+        raw_path = self.video_dir(video_id) / "transcript.raw.json"
+        if not self.raw_cache_valid(video_id, path) or (raw_path.exists() and not self.raw_cache_valid(video_id, raw_path)):
             return None
         return self._load_transcript_path(path)
 
     def load_analysis(self, video_id: str, variant: str = "default") -> dict[str, Any] | None:
         path = self._analysis_path(video_id, variant)
-        if not path.exists():
+        if not self.derived_cache_valid(video_id, path):
             return None
         return self._read_json(path)
 
@@ -239,7 +349,7 @@ class LibraryStore:
         for video_dir in sorted((self.root / "videos").glob("*")):
             metadata_path = video_dir / "metadata.json"
             analysis_path = video_dir / "analysis.json"
-            if metadata_path.exists() and analysis_path.exists():
+            if self.raw_cache_valid(video_dir.name, metadata_path) and self.derived_cache_valid(video_dir.name, analysis_path):
                 pairs.append((self._read_json(metadata_path), self._read_json(analysis_path)))
         return pairs
 
@@ -253,7 +363,7 @@ class LibraryStore:
 
     def load_graph_extraction(self, video_id: str, variant: str = "default") -> dict[str, Any] | None:
         path = self._graph_extraction_path(video_id, variant)
-        if not path.exists():
+        if not self.derived_cache_valid(video_id, path):
             return None
         return self._read_json(path)
 
@@ -261,7 +371,7 @@ class LibraryStore:
         extractions: list[dict[str, Any]] = []
         for video_dir in sorted((self.root / "videos").glob("*")):
             path = video_dir / "graph_extraction.json"
-            if path.exists():
+            if self.derived_cache_valid(video_dir.name, path):
                 extractions.append(self._read_json(path))
         return extractions
 
@@ -281,7 +391,8 @@ class LibraryStore:
         self._write_json(paths.raw, raw)
         if normalized_source is not None:
             self._write_json(paths.normalized_source, normalized_source)
-        self._write_json(paths.normalized, normalized)
+        if summary_variant != "source":
+            self._write_json(paths.normalized, normalized)
         summary_path = paths.summary_source if summary_variant == "source" else paths.summary
         summary = self.load_visual_summary(video_id, variant=summary_variant) or {
             "schema_version": "visual-summary-v1",
@@ -305,14 +416,14 @@ class LibraryStore:
 
     def load_visual_frame(self, video_id: str, timestamp_key: str) -> dict[str, Any] | None:
         path = self.visual_artifact_paths(video_id, timestamp_key).normalized
-        if not path.exists():
+        if not self.derived_cache_valid(video_id, path):
             return None
         return self._read_json(path)
 
     def load_visual_summary(self, video_id: str, variant: str = "default") -> dict[str, Any] | None:
         name = "visual_summary.source.json" if variant == "source" else "visual_summary.json"
         path = self.video_dir(video_id) / "visual" / name
-        if not path.exists():
+        if not self.derived_cache_valid(video_id, path):
             return None
         return self._read_json(path)
 
@@ -335,19 +446,21 @@ class LibraryStore:
         for video_dir in sorted((self.root / "videos").glob("*")):
             if video_id is not None and video_dir.name != video_id:
                 continue
+            if self.load_video_metadata(video_dir.name) is None or self.load_normalized_transcript(video_dir.name) is None:
+                continue
             metadata_path = video_dir / "metadata.json"
             source_transcript_path = video_dir / "transcript.normalized.json"
             translated_transcript_path = video_dir / f"transcript.{target_language}.json"
             translated_analysis_path = video_dir / f"analysis.{target_language}.json"
-            if prefer_translation and translated_transcript_path.exists():
-                if not translated_analysis_path.exists():
+            if prefer_translation and self.derived_cache_valid(video_dir.name, translated_transcript_path):
+                if not self.derived_cache_valid(video_dir.name, translated_analysis_path):
                     raise RuntimeError(f"Missing {translated_analysis_path.name} for translated graph rebuild")
                 transcript_path = translated_transcript_path
                 analysis_path = translated_analysis_path
             else:
                 transcript_path = source_transcript_path
                 analysis_path = video_dir / "analysis.json"
-            if metadata_path.exists() and transcript_path.exists() and analysis_path.exists():
+            if metadata_path.exists() and transcript_path.exists() and self.derived_cache_valid(video_dir.name, analysis_path):
                 triples.append(
                     (
                         self._read_json(metadata_path),
@@ -518,7 +631,16 @@ class LibraryStore:
 
     @staticmethod
     def _write_json(path: Path, data: Any) -> None:
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        # Readers in other workers must never observe partially written JSON.
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump(data, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _read_json(path: Path) -> Any:

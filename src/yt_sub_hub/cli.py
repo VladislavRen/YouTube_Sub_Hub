@@ -107,7 +107,8 @@ if typer is not None:
     @app.command()
     def process(
         url: str,
-        force: bool = typer.Option(False, "--force", "-f", help="Run a new analysis even if the video already exists."),
+        force: bool = typer.Option(False, "--force", "-f", help="Reanalyze without prompting; fresh source caches may be reused."),
+        refresh: bool = typer.Option(False, "--refresh", help="Fetch live metadata and transcript, then regenerate dependent artifacts; never reuse stale inputs on failure."),
         quality_mode: str | None = typer.Option(None, "--quality-mode", help="Quality mode: strict, best_effort, or draft."),
         acceptance_mode: str | None = typer.Option(None, "--acceptance-mode", help="Acceptance mode: data_api_only or full_processing."),
     ) -> None:
@@ -123,7 +124,7 @@ if typer is not None:
         if updates:
             pipeline.settings = replace(pipeline.settings, **updates)
         existing = pipeline.already_processed(url)
-        if existing is not None and not force:
+        if existing is not None and not force and not refresh:
             video_id, existing_note = existing
             should_reprocess = typer.confirm(
                 (
@@ -136,7 +137,7 @@ if typer is not None:
                 typer.echo(f"skipped_existing: {video_id} -> {existing_note}")
                 return
         try:
-            record = pipeline.process(url)
+            record = pipeline.process(url, refresh=True) if refresh else pipeline.process(url)
         except Exception as exc:
             from yt_sub_hub.ingestion import YouTubeAuthRequiredError
 
@@ -146,6 +147,21 @@ if typer is not None:
             raise
         suffix = f" warning={record.warning}" if record.warning else ""
         typer.echo(f"{record.status}: {record.video_id} -> {record.note_path}{suffix}")
+
+    @app.command("cache-cleanup")
+    def cache_cleanup(
+        apply: bool = typer.Option(False, "--apply", help="Delete expired raw metadata/transcript files. Without this option, only preview candidates."),
+    ) -> None:
+        from yt_sub_hub.config import get_settings
+        from yt_sub_hub.library import LibraryStore
+
+        candidates = LibraryStore(get_settings().library_dir).cleanup_expired_raw_cache(apply=apply)
+        _echo_payload({
+            "mode": "apply" if apply else "dry-run",
+            "max_age_days": 30,
+            "files": [str(path) for path in candidates],
+            "scope": "raw metadata and source transcripts only; notes, derived files, discovery data, and Neo4j are retained",
+        }, json_output=True)
 
     @app.command()
     def status(job_id: str) -> None:
@@ -189,6 +205,16 @@ if typer is not None:
         resolved_acceptance_mode = normalize_acceptance_mode(acceptance_mode or settings.acceptance_mode)
         parsed = parse_youtube_url(url)
         store = LibraryStore(settings.library_dir)
+        from yt_sub_hub.pipeline import job_id_for_url
+
+        try:
+            _runtime_store().update_video_job_modes(
+                job_id_for_url(url), quality_mode=quality_mode, acceptance_mode=acceptance_mode,
+            )
+        except KeyError:
+            pass
+        except RuntimeError as exc:
+            raise typer.BadParameter(str(exc)) from exc
         record = VideoProcessingPipeline(store=store, enable_default_graph=False).submit(url)
         runtime_record = _runtime_store().create_video_job(
             job_id=record.job_id,
@@ -198,6 +224,12 @@ if typer is not None:
             quality_mode=resolved_quality_mode,
             acceptance_mode=resolved_acceptance_mode,
         )
+        try:
+            runtime_record = _runtime_store().update_video_job_modes(
+                runtime_record.id, quality_mode=quality_mode, acceptance_mode=acceptance_mode,
+            )
+        except RuntimeError as exc:
+            raise typer.BadParameter(str(exc)) from exc
         if runtime_record.status not in {"queued", "running"}:
             runtime_record = _runtime_store().resume_video_job(runtime_record.id)
         typer.echo(
@@ -233,8 +265,14 @@ if typer is not None:
                 return False
 
         def processor(job):
+            from dataclasses import replace
+
             _ensure_legacy_job_for_runtime(store, job)
-            return _worker_pipeline(store, cancel_requested).process_job(job.id)
+            pipeline = _worker_pipeline(store, cancel_requested)
+            pipeline.settings = replace(
+                settings, quality_mode=job.quality_mode, acceptance_mode=job.acceptance_mode,
+            )
+            return pipeline.process_job(job.id)
 
         result = StageWorker(
             runtime,
@@ -676,7 +714,7 @@ if typer is not None:
     def discover_youtube(
         video_id: str,
         limit: int = typer.Option(20, "--limit", help="Maximum normalized video candidates."),
-        max_quota_units: int = typer.Option(900, "--max-quota-units", help="Maximum YouTube Data API quota units for this run."),
+        max_quota_units: int = typer.Option(900, "--max-quota-units", help="Maximum general Data API units for this discovery run; search has a separate 100-call budget."),
         json_output: bool = typer.Option(False, "--json", help="Emit strict JSON."),
     ) -> None:
         from yt_sub_hub.config import get_settings
@@ -704,7 +742,7 @@ if typer is not None:
     def queue_discovery(
         video_id: str,
         limit: int = typer.Option(20, "--limit", help="Maximum normalized video candidates."),
-        max_quota_units: int = typer.Option(900, "--max-quota-units", help="Maximum YouTube Data API quota units for this run."),
+        max_quota_units: int = typer.Option(900, "--max-quota-units", help="Maximum general Data API units for this discovery run; search has a separate 100-call budget."),
         force: bool = typer.Option(False, "--force", help="Requeue the existing discovery job for this source video."),
         json_output: bool = typer.Option(False, "--json", help="Emit strict JSON."),
     ) -> None:

@@ -1,5 +1,7 @@
 import sqlite3
 
+import pytest
+
 from yt_sub_hub.api import create_job_record
 from yt_sub_hub.models import JobRecord
 from yt_sub_hub.runtime import RuntimeStore
@@ -54,6 +56,76 @@ def test_create_job_api_accepts_acceptance_mode_override(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert response.json()["acceptance_mode"] == "full_processing"
     assert RuntimeStore(tmp_path / "index.sqlite3").load_video_job(response.json()["job_id"]).acceptance_mode == "full_processing"
+
+
+@pytest.mark.parametrize("previous_status", ["failed", "completed"])
+def test_reprocessing_applies_explicit_modes_to_existing_job(tmp_path, monkeypatch, previous_status):
+    from fastapi.testclient import TestClient
+    import yt_sub_hub.api as api_module
+
+    monkeypatch.setenv("YT_SUB_HUB_LIBRARY_DIR", str(tmp_path))
+    monkeypatch.setattr(api_module, "process_existing_job", lambda *args: None)
+    client = TestClient(api_module.create_app())
+    initial = client.post("/jobs", json={"url": "https://youtu.be/abc123def45", "quality_mode": "strict", "acceptance_mode": "data_api_only"}).json()
+    runtime = RuntimeStore(tmp_path / "index.sqlite3")
+    with sqlite3.connect(runtime.db_path) as db:
+        db.execute("UPDATE video_jobs SET status = ? WHERE id = ?", (previous_status, initial["job_id"]))
+
+    response = client.post("/jobs", json={"url": "https://youtu.be/abc123def45", "force": True, "quality_mode": "best_effort", "acceptance_mode": "full_processing"})
+
+    assert response.status_code == 200
+    record = runtime.load_video_job(initial["job_id"])
+    assert record.acceptance_mode == response.json()["acceptance_mode"] == "full_processing"
+    assert record.quality_mode == response.json()["quality_mode"] == "best_effort"
+
+
+def test_reprocessing_rejects_mode_change_while_job_is_running(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    import yt_sub_hub.api as api_module
+
+    monkeypatch.setenv("YT_SUB_HUB_LIBRARY_DIR", str(tmp_path))
+    monkeypatch.setattr(api_module, "process_existing_job", lambda *args: None)
+    client = TestClient(api_module.create_app())
+    initial = client.post("/jobs", json={"url": "https://youtu.be/abc123def45", "acceptance_mode": "data_api_only"}).json()
+    runtime = RuntimeStore(tmp_path / "index.sqlite3")
+    with sqlite3.connect(runtime.db_path) as db:
+        db.execute("UPDATE video_jobs SET status = 'running', lease_owner = 'active-worker' WHERE id = ?", (initial["job_id"],))
+
+    response = client.post("/jobs", json={"url": "https://youtu.be/abc123def45", "force": True, "acceptance_mode": "full_processing"})
+
+    assert response.status_code == 409
+    assert runtime.load_video_job(initial["job_id"]).acceptance_mode == "data_api_only"
+
+
+@pytest.mark.parametrize("interface", ["api", "cli"])
+def test_rejected_mode_change_preserves_aged_active_legacy_record(tmp_path, monkeypatch, interface):
+    import time
+    from fastapi.testclient import TestClient
+    import yt_sub_hub.api as api_module
+
+    monkeypatch.setenv("YT_SUB_HUB_LIBRARY_DIR", str(tmp_path))
+    monkeypatch.setattr(api_module, "process_existing_job", lambda *args: None)
+    client = TestClient(api_module.create_app())
+    url = "https://youtu.be/abc123def45"
+    initial = client.post("/jobs", json={"url": url, "acceptance_mode": "data_api_only"}).json()
+    runtime = RuntimeStore(tmp_path / "index.sqlite3")
+    with sqlite3.connect(runtime.db_path) as db:
+        db.execute("UPDATE video_jobs SET status = 'running', lease_owner = 'active-worker', lease_until = ? WHERE id = ?", (time.time() + 900, initial["job_id"]))
+        db.execute("UPDATE jobs SET status = 'running', stage = 'analysis_translation', note_path = 'existing.md', warning = 'keep this', updated_at = ? WHERE job_id = ?", (time.time() - 7200, initial["job_id"]))
+        before = list(db.iterdump())
+
+    if interface == "api":
+        response = client.post("/jobs", json={"url": url, "force": True, "acceptance_mode": "full_processing"})
+        assert response.status_code == 409
+    else:
+        from typer.testing import CliRunner
+        from yt_sub_hub.cli import app
+        response = CliRunner().invoke(app, ["enqueue-video", url, "--acceptance-mode", "full_processing"])
+        assert response.exit_code != 0
+        assert "Cannot change processing modes" in response.output
+
+    with sqlite3.connect(runtime.db_path) as db:
+        assert list(db.iterdump()) == before
 
 
 def test_process_existing_job_passes_runtime_quality_mode_to_pipeline_settings(tmp_path, monkeypatch):

@@ -19,7 +19,7 @@ from yt_sub_hub.library import LibraryStore
 from yt_sub_hub.models import Analysis, Claim, Concept, JobRecord, NoteSection, Transcript, TranscriptSegment, slugify
 from yt_sub_hub.notes import render_markdown_note
 from yt_sub_hub.pipeline import VideoProcessingPipeline, _analysis_matches_target_language
-from yt_sub_hub.product_quality import evaluate_product_quality
+from yt_sub_hub.product_quality import build_product_quality_payload
 from yt_sub_hub.quality import run_quality_gate
 from yt_sub_hub.runtime import StagePlanRecord, VideoJobRecord
 from yt_sub_hub.transcripts import (
@@ -117,6 +117,13 @@ class StagePipeline:
         return StageContext(job=job, stage=stage, settings=self.settings, store=self.store, pipeline=self.pipeline, runtime=runtime)
 
     def run(self, ctx: StageContext) -> StageResult:
+        parallel_artifact_stage = ctx.stage.stage_name.startswith((
+            "youtube_discovery_", "analysis_chunk_", "transcript_translation_chunk_",
+        ))
+        with ctx.store.video_lock(ctx.job.video_id, shared=parallel_artifact_stage):
+            return self._run_locked(ctx)
+
+    def _run_locked(self, ctx: StageContext) -> StageResult:
         if _quality_mode(ctx) == "draft" and ctx.stage.stage_name in {
             "deterministic_graph",
             "deep_graph_llm",
@@ -148,15 +155,15 @@ class StagePipeline:
         cached = ctx.store.load_video_metadata(ctx.job.video_id)
         if cached is not None:
             return StageResult.completed(warning="metadata cache hit")
+        ctx.store.invalidate_source_cache(ctx.job.video_id)
         metadata = ctx.pipeline._fetch_or_load_metadata(self._legacy_record(ctx.job), [])
-        paths = ctx.store.artifact_paths(ctx.job.video_id)
-        paths.video_dir.mkdir(parents=True, exist_ok=True)
-        ctx.store._write_json(paths.metadata, metadata.to_dict())
+        ctx.store.save_source_metadata(metadata)
         return StageResult.completed()
 
     def _transcript_source(self, ctx: StageContext) -> StageResult:
         if ctx.store.load_normalized_transcript(ctx.job.video_id) is not None:
             return StageResult.completed(warning="transcript cache hit", skip_stages=["audio_download", "whisper_transcription"])
+        ctx.store.invalidate_source_cache(ctx.job.video_id)
         acceptance_mode = _acceptance_mode(ctx)
         try:
             raw, normalized = build_transcript_provider(
@@ -181,10 +188,7 @@ class StagePipeline:
             return StageResult.completed(warning="needs whisper fallback")
         except Exception as exc:
             return StageResult.failed(str(exc))
-        paths = ctx.store.artifact_paths(ctx.job.video_id)
-        paths.video_dir.mkdir(parents=True, exist_ok=True)
-        ctx.store._write_json(paths.raw_transcript, raw)
-        ctx.store._write_json(paths.normalized_transcript, normalized.to_dict())
+        ctx.store.save_source_transcript(ctx.job.video_id, raw, normalized)
         return StageResult.completed(skip_stages=["audio_download", "whisper_transcription"])
 
     def _audio_download(self, ctx: StageContext) -> StageResult:
@@ -207,10 +211,8 @@ class StagePipeline:
             return StageResult.failed(f"audio artifact is required before whisper_transcription: {audio_path}")
         try:
             bundle = build_whisper_backend(ctx.settings).transcribe(audio_path, video_id=ctx.job.video_id)
-            paths = ctx.store.artifact_paths(ctx.job.video_id)
-            paths.video_dir.mkdir(parents=True, exist_ok=True)
-            ctx.store._write_json(paths.raw_transcript, bundle.raw_payload)
-            ctx.store._write_json(paths.normalized_transcript, bundle.normalized.to_dict())
+            ctx.store.invalidate_source_cache(ctx.job.video_id)
+            ctx.store.save_source_transcript(ctx.job.video_id, bundle.raw_payload, bundle.normalized)
             return StageResult.completed()
         finally:
             if not ctx.settings.keep_audio:
@@ -242,7 +244,7 @@ class StagePipeline:
         target = str(payload.get("target_language") or _target_language(ctx))
         chunk_index = int(payload["chunk_index"])
         chunk_path = _translation_chunk_path(ctx.store, ctx.job.video_id, chunk_index)
-        if _valid_translation_chunk_artifact(chunk_path, transcript, payload, target):
+        if ctx.store.derived_cache_valid(ctx.job.video_id, chunk_path) and _valid_translation_chunk_artifact(chunk_path, transcript, payload, target):
             return StageResult.completed(warning="translation chunk cache hit")
         start_index = int(payload["source_segment_start_index"])
         end_index = int(payload["source_segment_end_index"])
@@ -320,7 +322,7 @@ class StagePipeline:
             raise RuntimeError("analysis chunk payload transcript hash does not match current transcript")
         chunk_index = int(payload["chunk_index"])
         chunk_path = _analysis_chunk_path(ctx.store, ctx.job.video_id, chunk_index)
-        if _valid_analysis_chunk_artifact(chunk_path, transcript, payload):
+        if ctx.store.derived_cache_valid(ctx.job.video_id, chunk_path) and _valid_analysis_chunk_artifact(chunk_path, transcript, payload):
             return StageResult.completed(warning="analysis chunk cache hit")
         start_index = int(payload["source_segment_start_index"])
         end_index = int(payload["source_segment_end_index"])
@@ -476,7 +478,7 @@ class StagePipeline:
         if metadata is None or analysis_data is None:
             raise RuntimeError("metadata and analysis are required")
         note_path = ctx.store.note_path(ctx.job.video_id)
-        if note_path.exists() and note_path.read_text(encoding="utf-8").strip():
+        if ctx.store.derived_cache_valid(ctx.job.video_id, note_path) and note_path.read_text(encoding="utf-8").strip():
             note_text = note_path.read_text(encoding="utf-8")
             if (
                 not ctx.settings.enable_translation
@@ -643,11 +645,14 @@ class StagePipeline:
             raise RuntimeError(f"graph_extraction.json must be generated from {target} transcript and analysis before neo4j_sync")
         if ctx.settings.enable_translation and target.strip().lower() == "ru":
             quality = run_quality_gate(ctx.store, ctx.job.video_id, target_language=target)
-            product_quality = evaluate_product_quality(
+            product_quality = build_product_quality_payload(
+                ctx.store,
+                ctx.job.video_id,
                 _quality_mode(ctx),
                 quality,
                 load_ru_artifact_review(ctx.store, ctx.job.video_id),
-                ctx.runtime.list_stage_plan(ctx.job.id) if ctx.runtime is not None else [],
+                [stage for stage in ctx.runtime.list_stage_plan(ctx.job.id) if stage.stage_name != "neo4j_sync"]
+                if ctx.runtime is not None else [],
             )
             if not product_quality["graph_sync_allowed"]:
                 raise RuntimeError(
@@ -656,8 +661,7 @@ class StagePipeline:
                 )
         graph_store = Neo4jGraphStore(ctx.settings.neo4j_uri, ctx.settings.neo4j_user, ctx.settings.neo4j_password)
         try:
-            graph_store.delete_video_relationships(ctx.job.video_id)
-            graph_store.upsert_payload(graph_payload_from_extraction(extraction))
+            graph_store.replace_video_core_payload(ctx.job.video_id, graph_payload_from_extraction(extraction))
         finally:
             graph_store.close()
         return StageResult.completed()
@@ -1022,6 +1026,8 @@ def _load_analysis_chunk_artifacts(
         path = _analysis_chunk_path(ctx.store, ctx.job.video_id, chunk_index)
         if not path.exists():
             raise RuntimeError(f"missing analysis chunk {chunk_index:03d}")
+        if not ctx.store.derived_cache_valid(ctx.job.video_id, path):
+            raise RuntimeError(f"stale analysis chunk {chunk_index:03d}; rerun analysis chunks after source refresh")
         artifact = json.loads(path.read_text(encoding="utf-8"))
         _validate_analysis_chunk_artifact(artifact, transcript, payload)
         start_index = int(payload["source_segment_start_index"])
@@ -1397,6 +1403,8 @@ def _merge_translation_chunks(
         path = _translation_chunk_path(ctx.store, ctx.job.video_id, chunk_index)
         if not path.exists():
             raise RuntimeError(f"missing translation chunk {chunk_index:03d}")
+        if not ctx.store.derived_cache_valid(ctx.job.video_id, path):
+            raise RuntimeError(f"stale translation chunk {chunk_index:03d}; rerun translation chunks after source refresh")
         artifact = json.loads(path.read_text(encoding="utf-8"))
         _validate_translation_chunk_artifact(artifact, transcript, payload, target)
         for segment in artifact["segments"]:

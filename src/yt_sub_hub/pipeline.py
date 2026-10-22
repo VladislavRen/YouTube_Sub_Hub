@@ -130,11 +130,13 @@ class VideoProcessingPipeline:
         self.store.save_job(record)
         return record
 
-    def process(self, url: str) -> JobRecord:
+    def process(self, url: str, *, refresh: bool = False) -> JobRecord:
         record = self.submit(url)
         if record.status == "running":
+            if refresh:
+                raise RuntimeError("Cannot refresh a video while its job is running")
             return record
-        return self.process_job(record.job_id)
+        return self.process_job(record.job_id, refresh=refresh)
 
     def already_processed(self, url: str) -> tuple[str, str] | None:
         parsed = parse_youtube_url(url)
@@ -159,7 +161,14 @@ class VideoProcessingPipeline:
                 return None
         return parsed.video_id, str(self.store.note_path(parsed.video_id))
 
-    def process_job(self, job_id: str) -> JobRecord:
+    def process_job(self, job_id: str, *, refresh: bool = False) -> JobRecord:
+        record = self.store.load_jobs().get(job_id)
+        if record is None:
+            raise KeyError(f"Unknown job: {job_id}")
+        with self.store.video_lock(record.video_id):
+            return self._process_job_locked(job_id, refresh=refresh)
+
+    def _process_job_locked(self, job_id: str, *, refresh: bool = False) -> JobRecord:
         jobs = self.store.load_jobs()
         if job_id not in jobs:
             raise KeyError(f"Unknown job: {job_id}")
@@ -168,6 +177,8 @@ class VideoProcessingPipeline:
         try:
             self.store.update_job_stage(job_id, status="running", stage="running")
             self._raise_if_cancelled(job_id)
+            if refresh or self.store.has_expired_inputs(record.video_id):
+                self.store.invalidate_source_cache(record.video_id, refresh_inputs=True)
             metadata = self._fetch_or_load_metadata(record, warnings)
             self.store.update_job_stage(job_id, status="running", stage="metadata_fetched")
             self._raise_if_cancelled(job_id)
@@ -254,12 +265,16 @@ class VideoProcessingPipeline:
         ):
             return cached
         try:
-            return fetch_video_metadata(record.url, settings=self.settings)
+            metadata = fetch_video_metadata(record.url, settings=self.settings)
         except Exception as exc:
             if cached is None:
                 raise
             warnings.append(f"Used cached metadata because YouTube metadata fetch failed: {exc}")
             return cached
+        if cached is not None and cached.to_dict() != metadata.to_dict():
+            self.store.invalidate_source_cache(record.video_id)
+        self.store.save_source_metadata(metadata)
+        return metadata
 
     def _resolve_or_load_transcript(
         self,
@@ -275,6 +290,7 @@ class VideoProcessingPipeline:
                 else:
                     warnings.append("Used cached transcript because live metadata fetch already failed")
             return cached
+        self.store.invalidate_source_cache(metadata.video_id)
         try:
             whisper_provider = None
             if self.settings.acceptance_mode == "full_processing":
@@ -284,7 +300,7 @@ class VideoProcessingPipeline:
                     keep_audio=self.settings.keep_audio,
                     settings=self.settings,
                 )
-            return resolve_transcript_bundle(
+            bundle = resolve_transcript_bundle(
                 metadata.video_id,
                 transcript_provider=build_transcript_provider(
                     self.settings,
@@ -292,6 +308,8 @@ class VideoProcessingPipeline:
                 ),
                 whisper_provider=whisper_provider,
             )
+            self.store.save_source_transcript(metadata.video_id, bundle.raw_payload, bundle.normalized)
+            return bundle
         except TranscriptResolutionError as exc:
             cached = self._cached_transcript_bundle(metadata.video_id)
             if cached is None:
@@ -449,6 +467,17 @@ class VideoProcessingPipeline:
                 if self._quality_mode() == "strict":
                     warning = f"{warning}; Graph sync skipped because strict mode has review warnings"
                     return paths, warning
+            from yt_sub_hub.product_quality import build_product_quality_payload
+
+            product_quality = build_product_quality_payload(
+                self.store, metadata.video_id, self._quality_mode(),
+                ru_artifact_review=review_report.to_dict(),
+            )
+            if not product_quality["graph_sync_allowed"]:
+                message = "Graph sync blocked by product quality: " + "; ".join(product_quality["reasons"])
+                if product_quality["status"] == "failed":
+                    raise RuntimeError(message)
+                return paths, f"{warning}; {message}" if warning else message
         payload = graph_payload_from_extraction(graph_extraction)
         if self._graph_enabled():
             try:
@@ -457,7 +486,7 @@ class VideoProcessingPipeline:
                     self.settings.neo4j_user,
                     self.settings.neo4j_password,
                 )
-                graph_store.upsert_payload(payload)
+                graph_store.replace_video_core_payload(metadata.video_id, payload)
             except Exception as exc:
                 if not self.settings.graph_best_effort:
                     raise
@@ -763,9 +792,10 @@ class VideoProcessingPipeline:
                 saved_extraction = merge_visual_summary_into_extraction(saved_extraction, visual_summary)
             self.store.save_graph_extraction(metadata.video_id, saved_extraction)
             if not dry_run:
-                if video_id is not None:
-                    graph_store.delete_video_relationships(metadata.video_id)
-                graph_store.upsert_payload(graph_payload_from_extraction(saved_extraction, min_confidence=min_confidence))
+                graph_store.replace_video_core_payload(
+                    metadata.video_id,
+                    graph_payload_from_extraction(saved_extraction, min_confidence=min_confidence),
+                )
             count += 1
         return count
 

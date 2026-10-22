@@ -198,6 +198,26 @@ class Neo4jGraphStore:
             for relationship in payload.relationships:
                 session.execute_write(self._merge_relationship, relationship)
 
+    def replace_video_core_payload(self, video_id: str, payload: GraphPayload) -> None:
+        """Replace core edges atomically while retaining separately owned enrichment."""
+        self.ensure_schema()
+        with self._driver.session() as session:
+            session.execute_write(self._replace_video_core_payload, video_id, payload)
+
+    @staticmethod
+    def _replace_video_core_payload(tx, video_id: str, payload: GraphPayload) -> None:
+        tx.run(
+            "MATCH ()-[r]->() "
+            "WHERE r.source_video_id = $video_id "
+            "AND r.research_run_id IS NULL AND r.discovery_run_id IS NULL "
+            "DELETE r",
+            video_id=video_id,
+        )
+        for node in payload.nodes:
+            Neo4jGraphStore._merge_node(tx, node)
+        for relationship in payload.relationships:
+            Neo4jGraphStore._merge_relationship(tx, relationship)
+
     def clear(self) -> None:
         with self._driver.session() as session:
             session.run("MATCH (n) DETACH DELETE n")

@@ -6,8 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from yt_sub_hub.config import Settings
-
-YOUTUBE_API_SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"]
+from yt_sub_hub.youtube_oauth import YOUTUBE_API_SCOPES, save_credentials, validate_scopes
 
 
 class YouTubeDataApiClientError(RuntimeError):
@@ -50,6 +49,47 @@ def google_api_error_class(exc: BaseException) -> str:
     return "unknown_error"
 
 
+def _authorized_http(credentials):
+    """Use configured environment/system HTTP CONNECT or SOCKS proxies for API access."""
+    from urllib.parse import unquote, urlsplit
+    from urllib.request import getproxies, proxy_bypass
+
+    import httplib2
+    import socks
+    from google_auth_httplib2 import AuthorizedHttp
+
+    proxies = getproxies()
+
+    class SystemProxyInfo(httplib2.ProxyInfo):
+        def applies_to(self, hostname):
+            return not proxy_bypass(hostname)
+
+    def proxy_for_scheme(scheme):
+        url = proxies.get(scheme) or proxies.get("all")
+        if not url:
+            return None
+        parsed = urlsplit(url if "://" in url else f"http://{url}")
+        routes = {
+            "http": (socks.HTTP, 80, True),
+            "socks4": (socks.SOCKS4, 1080, False),
+            "socks4a": (socks.SOCKS4, 1080, True),
+            "socks5": (socks.SOCKS5, 1080, False),
+            "socks5h": (socks.SOCKS5, 1080, True),
+        }
+        if parsed.scheme == "https":
+            raise ValueError("TLS-to-proxy URLs are unsupported by the Google API transport; configure an HTTP CONNECT or SOCKS proxy.")
+        if parsed.scheme not in routes or not parsed.hostname:
+            raise ValueError("Unsupported Google API proxy URL; use HTTP CONNECT or SOCKS.")
+        kind, default_port, remote_dns = routes[parsed.scheme]
+        return SystemProxyInfo(
+            kind, parsed.hostname, parsed.port or default_port, proxy_rdns=remote_dns,
+            proxy_user=unquote(parsed.username) if parsed.username else None,
+            proxy_pass=unquote(parsed.password) if parsed.password else None,
+        )
+
+    return AuthorizedHttp(credentials, http=httplib2.Http(timeout=60, proxy_info=proxy_for_scheme))
+
+
 def build_youtube_client(settings: Settings, *, persist_refresh: bool = True):
     token_path = Path(settings.youtube_api_token_file or "")
     if not settings.youtube_api_token_file or not token_path.exists():
@@ -64,22 +104,23 @@ def build_youtube_client(settings: Settings, *, persist_refresh: bool = True):
         raise YouTubeDataApiClientError("google-api-python-client and google-auth are required") from exc
 
     try:
-        creds = Credentials.from_authorized_user_file(str(token_path), YOUTUBE_API_SCOPES)
-        if hasattr(creds, "has_scopes") and not creds.has_scopes(YOUTUBE_API_SCOPES):
-            raise YouTubeDataApiClientError(
-                "YouTube Data API token does not include required youtube.force-ssl scope."
-            )
+        creds = Credentials.from_authorized_user_file(str(token_path))
+        validate_scopes(creds)
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
+            validate_scopes(creds)
             if persist_refresh:
-                token_path.write_text(creds.to_json(), encoding="utf-8")
+                save_credentials(token_path, creds)
         if getattr(creds, "expired", False) and not getattr(creds, "refresh_token", None):
             raise YouTubeDataApiClientError("YouTube Data API token is expired and has no refresh token.")
-        return build("youtube", "v3", credentials=creds)
+        return build("youtube", "v3", http=_authorized_http(creds))
     except YouTubeDataApiClientError:
         raise
     except Exception as exc:
-        raise YouTubeDataApiClientError(f"YouTube Data API credentials are not usable: {sanitize_google_api_message(exc)}") from exc
+        raise YouTubeDataApiClientError(
+            f"YouTube Data API credentials are not usable: {sanitize_google_api_message(exc)}. "
+            "Reauthorize with yt-sub-hub-auth (or python youtube_auth_test.py)."
+        ) from exc
 
 
 def _extract_google_error_message(exc: BaseException) -> str:

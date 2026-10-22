@@ -888,6 +888,33 @@ class RuntimeStore:
             raise KeyError(f"Unknown video job: {job_id}")
         return _video_job_from_row(row)
 
+    def update_video_job_modes(
+        self, job_id: str, *, quality_mode: str | None = None, acceptance_mode: str | None = None,
+    ) -> VideoJobRecord:
+        """Apply explicit retry options without changing an active worker's contract."""
+        from yt_sub_hub.config import normalize_acceptance_mode, normalize_quality_mode
+
+        self.ensure_db()
+        quality = normalize_quality_mode(quality_mode) if quality_mode is not None else None
+        acceptance = normalize_acceptance_mode(acceptance_mode) if acceptance_mode is not None else None
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, lease_owner, quality_mode, acceptance_mode FROM video_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown video job: {job_id}")
+            next_modes = (quality or row[2], acceptance or row[3])
+            if next_modes != (row[2], row[3]):
+                if row[0] == "running" or row[1] is not None:
+                    raise RuntimeError("Cannot change processing modes while the job is running; wait or cancel it first.")
+                conn.execute(
+                    "UPDATE video_jobs SET quality_mode = ?, acceptance_mode = ?, updated_at = ? WHERE id = ?",
+                    (*next_modes, time.time(), job_id),
+                )
+        return self.load_video_job(job_id)
+
     def update_video_job_quality_mode(self, job_id: str, quality_mode: str) -> VideoJobRecord:
         self.ensure_db()
         from yt_sub_hub.config import normalize_quality_mode

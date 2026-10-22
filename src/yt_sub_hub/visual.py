@@ -405,6 +405,9 @@ class VisualAnalysisService:
     ) -> dict[str, Any]:
         key = timestamp_key(timestamp_seconds)
         cached = self.store.load_visual_frame(video_id, key)
+        if cached is not None and self.settings.enable_translation and not self.settings.translation_best_effort:
+            if cached.get("language") != self.settings.target_language:
+                cached = None
         if cached is not None and not force:
             return cached
         if not self.settings.vision_model:
@@ -457,7 +460,7 @@ class VisualAnalysisService:
                 translator = self.translation_provider or self._default_translation_provider()
                 normalized = translator.translate_visual_frame(normalized_source, self.settings.target_language)
                 normalized.setdefault("language", self.settings.target_language)
-                normalized.setdefault("translated_from", normalized_source.get("language") or transcript.language or "unknown")
+                normalized.setdefault("translated_from", normalized_source.get("language") or "unknown")
             except Exception as exc:
                 self.store.save_visual_frame(
                     video_id,
@@ -518,12 +521,29 @@ class VisualAnalysisService:
     def _merge_graph_best_effort(self, video_id: str) -> None:
         try:
             from yt_sub_hub.graph_extraction import merge_visual_summary_into_extraction
+            from yt_sub_hub.artifact_review import review_ru_artifacts
 
-            extraction = self.store.load_graph_extraction(video_id)
-            summary = self.store.load_visual_summary(video_id)
-            if extraction is None or summary is None:
-                return
-            self.store.save_graph_extraction(video_id, merge_visual_summary_into_extraction(extraction, summary))
+            with self.store.video_lock(video_id):
+                extraction = self.store.load_graph_extraction(video_id)
+                summary = self.store.load_visual_summary(video_id)
+                if extraction is None or summary is None:
+                    return
+                paths = self.store.artifact_paths(video_id)
+                previous_graph = paths.graph_extraction.read_bytes()
+                previous_review = paths.ru_artifact_review.read_bytes() if paths.ru_artifact_review.exists() else None
+                try:
+                    self.store.save_graph_extraction(video_id, merge_visual_summary_into_extraction(extraction, summary))
+                    if previous_review is not None:
+                        # The existing review belongs to RU core artifacts,
+                        # independently of the current vision translation mode.
+                        review = review_ru_artifacts(video_id, self.store)
+                        if review.status == "failed":
+                            raise VisualAnalysisError("Visual graph merge failed RU artifact review")
+                except Exception:
+                    paths.graph_extraction.write_bytes(previous_graph)
+                    if previous_review is not None:
+                        paths.ru_artifact_review.write_bytes(previous_review)
+                    raise
         except Exception:
             if not self.settings.visual_best_effort:
                 raise

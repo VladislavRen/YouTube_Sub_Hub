@@ -123,10 +123,14 @@ class WhisperCppBackend:
                 if not text:
                     raise RuntimeError("whisper.cpp JSON output unavailable and stdout was empty")
                 payload = {"warning": "whisper.cpp JSON output unavailable; normalized from stdout", "text": text}
+        language = None
+        if isinstance(payload, dict):
+            result = payload.get("result")
+            language = payload.get("language") or (result.get("language") if isinstance(result, dict) else None)
         normalized = Transcript(
             video_id=video_id,
             source="whisper",
-            language=payload.get("language") if isinstance(payload, dict) else None,
+            language=language,
             segments=_segments_from_whisper_cpp_payload(payload),
         )
         return TranscriptBundle(video_id=video_id, source="whisper", raw_payload=payload, normalized=normalized)

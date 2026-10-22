@@ -18,7 +18,7 @@ class RecordingGraphStore:
         self.payloads = []
         self.clear_calls = 0
         self.operations = []
-        self.deleted_video_ids = []
+        self.replaced_video_ids = []
 
     def upsert_payload(self, payload):
         self.operations.append(("upsert_payload", payload))
@@ -28,9 +28,10 @@ class RecordingGraphStore:
         self.operations.append(("clear", None))
         self.clear_calls += 1
 
-    def delete_video_relationships(self, video_id):
-        self.operations.append(("delete_video_relationships", video_id))
-        self.deleted_video_ids.append(video_id)
+    def replace_video_core_payload(self, video_id, payload):
+        self.operations.append(("replace_video_core_payload", video_id, payload))
+        self.replaced_video_ids.append(video_id)
+        self.payloads.append(payload)
 
 
 def deep_graph_chunk_with_relationships(video_id="abc123"):
@@ -150,6 +151,8 @@ def rejected_deep_graph_chunk(video_id="abc123", chunk_id="chunk-2", error="Inva
 
 
 def enable_translation_settings(pipeline, best_effort=False):
+    # Minimal one-section fixtures exercise translation, not production coverage.
+    object.__setattr__(pipeline.settings, "quality_mode", "best_effort")
     object.__setattr__(pipeline.settings, "enable_translation", True)
     object.__setattr__(pipeline.settings, "translation_best_effort", best_effort)
     object.__setattr__(pipeline.settings, "translation_target_language", "ru")
@@ -257,7 +260,8 @@ def test_process_job_cancellation_after_metadata_prevents_transcript_resolution(
     assert cancelled.status == "skipped"
     assert cancelled.stage == "cancelled"
     assert cancelled.warning == "cancel requested"
-    assert not pipeline.store.artifact_paths("abc123def45").metadata.exists()
+    assert pipeline.store.load_video_metadata("abc123def45") == metadata
+    assert not pipeline.store.artifact_paths("abc123def45").normalized_transcript.exists()
 
 
 def test_library_store_saves_and_loads_source_and_russian_artifacts(tmp_path):
@@ -330,7 +334,7 @@ def test_persist_writes_graph_payload_when_graph_store_is_configured(tmp_path):
 
 def test_persist_completes_with_graph_warning_when_graph_store_fails(tmp_path):
     class FailingGraphStore:
-        def upsert_payload(self, payload):
+        def replace_video_core_payload(self, video_id, payload):
             raise RuntimeError("neo4j unavailable")
 
     pipeline = VideoProcessingPipeline.for_test(tmp_path, graph_store=FailingGraphStore())
@@ -397,6 +401,26 @@ def test_legacy_strict_review_warning_skips_graph_sync(tmp_path, monkeypatch):
     assert paths.note.exists()
     assert graph_store.payloads == []
     assert "Graph sync skipped because strict mode has review warnings" in warning
+
+
+def test_legacy_strict_artifact_score_warning_blocks_graph_even_when_review_passes(tmp_path, monkeypatch):
+    graph = RecordingGraphStore()
+    pipeline = VideoProcessingPipeline.for_test(tmp_path, graph_store=graph)
+    enable_translation_settings(pipeline)
+    object.__setattr__(pipeline.settings, "quality_mode", "strict")
+    metadata = VideoMetadata(video_id="abc123def45", canonical_url="https://youtu.be/abc123def45", title="Talk")
+    transcript = Transcript("abc123def45", "youtube", [TranscriptSegment(0, 1, "Русский текст")], language="ru")
+    analysis = sample_analysis(language="ru", abstract="Русский анализ", concept="Граф", claim_text="Граф помогает.")
+    monkeypatch.setattr("yt_sub_hub.artifact_quality_score.compute_artifact_quality_score", lambda *args, **kwargs: {
+        "status": "warning", "overall_score": 0.74, "reasons": ["coverage is low"],
+    })
+    paths, warning = pipeline.persist(
+        metadata, transcript.to_dict(), transcript, analysis,
+        working_transcript=transcript, transcript_translated=True, analysis_translated=True,
+    )
+    assert paths.note.exists()
+    assert graph.payloads == []
+    assert "coverage is low" in warning
 
 
 def test_persist_ru_review_failure_blocks_graph_payload_construction(tmp_path, monkeypatch):
@@ -610,7 +634,12 @@ def test_process_job_prefers_cached_transcript_after_metadata_fetch(tmp_path, mo
 def test_pipeline_youtube_caption_failure_uses_whisper_fallback_and_writes_source_transcripts(tmp_path, monkeypatch):
     video_id = "abc123def45"
     pipeline = VideoProcessingPipeline.for_test(tmp_path)
-    pipeline.settings = replace(pipeline.settings, acceptance_mode="full_processing", media_download_enabled=True)
+    pipeline.settings = replace(
+        pipeline.settings,
+        acceptance_mode="full_processing",
+        media_download_enabled=True,
+        youtube_api_token_file=None,
+    )
     metadata = VideoMetadata(
         video_id=video_id,
         canonical_url=f"https://www.youtube.com/watch?v={video_id}",
@@ -1156,7 +1185,7 @@ def test_cached_ru_transcript_retry_keeps_source_normalized_untouched(tmp_path, 
     assert pipeline.store.load_analysis(video_id, variant="ru")["abstract"] == "Русский анализ рынка."
 
 
-def test_retry_with_only_cached_ru_transcript_creates_downstream_artifacts_without_corrupting_source(tmp_path, monkeypatch):
+def test_retry_with_only_cached_ru_transcript_regenerates_translation_from_live_source(tmp_path, monkeypatch):
     video_id = "abc123def45"
     pipeline = VideoProcessingPipeline.for_test(tmp_path)
     enable_translation_settings(pipeline, best_effort=False)
@@ -1172,7 +1201,8 @@ def test_retry_with_only_cached_ru_transcript_creates_downstream_artifacts_witho
 
     class Translator:
         def translate_transcript(self, transcript, target_language):
-            raise AssertionError("transcript.ru.json should be reused")
+            assert transcript.full_text() == "hello"
+            return Transcript(video_id, "youtube", [TranscriptSegment(0, 1, "новое приветствие", raw_text="hello")], language="ru")
 
         def translate_analysis(self, analysis, target_language):
             return Analysis(
@@ -1192,7 +1222,7 @@ def test_retry_with_only_cached_ru_transcript_creates_downstream_artifacts_witho
     class Analyzer:
         def analyze(self, metadata, transcript):
             assert transcript.language == "ru"
-            assert transcript.segments[0].text == "привет"
+            assert transcript.segments[0].text == "новое приветствие"
             return sample_analysis(language="unknown", abstract="English analysis")
 
     monkeypatch.setattr("yt_sub_hub.pipeline.fetch_video_metadata", lambda url, settings=None: metadata)
@@ -1223,7 +1253,7 @@ def test_retry_with_only_cached_ru_transcript_creates_downstream_artifacts_witho
     assert paths.graph_extraction.exists()
     assert pipeline.store.load_normalized_transcript(video_id).language == "en"
     assert pipeline.store.load_normalized_transcript(video_id).segments[0].text == "hello"
-    assert pipeline.store.load_translated_transcript(video_id).segments[0].text == "привет"
+    assert pipeline.store.load_translated_transcript(video_id).segments[0].text == "новое приветствие"
     assert quality.hard_failures == []
 
 
@@ -1619,7 +1649,7 @@ def test_translation_deep_graph_refresh_does_not_use_cached_source_analysis(tmp_
     source_transcript = Transcript(video_id, "youtube", [TranscriptSegment(0, 10, "Support breakout text.")], language="en")
     russian_transcript = Transcript(video_id, "youtube", [TranscriptSegment(0, 10, "Русский пробой.")], language="ru")
     source_analysis = sample_analysis(language="en", abstract="Source analysis", concept="Support", claim_text="Support helps.")
-    pipeline.persist(metadata, source_transcript, source_transcript, source_analysis)
+    pipeline.store.save_video_artifacts(metadata, source_transcript, source_transcript, source_analysis, "cached note")
     pipeline.store.save_translated_transcript(video_id, russian_transcript)
     pipeline.store.save_graph_extraction(
         video_id,
@@ -1747,7 +1777,7 @@ def test_rebuild_graph_prefers_saved_graph_extraction(tmp_path):
     assert any(node["label"] == "SourceSegment" for node in graph_store.payloads[0].nodes)
 
 
-def test_rebuild_graph_deletes_video_relationships_before_upsert_for_video_id(tmp_path):
+def test_rebuild_graph_atomically_replaces_video_core_payload(tmp_path):
     graph_store = RecordingGraphStore()
     pipeline = VideoProcessingPipeline.for_test(tmp_path)
     metadata = VideoMetadata(video_id="abc123", canonical_url="https://youtu.be/abc123", title="Talk")
@@ -1770,10 +1800,9 @@ def test_rebuild_graph_deletes_video_relationships_before_upsert_for_video_id(tm
     count = pipeline.rebuild_graph(graph_store, video_id="abc123")
 
     assert count == 1
-    assert graph_store.deleted_video_ids == ["abc123"]
+    assert graph_store.replaced_video_ids == ["abc123"]
     assert [operation[0] for operation in graph_store.operations] == [
-        "delete_video_relationships",
-        "upsert_payload",
+        "replace_video_core_payload",
     ]
 
 
@@ -2250,7 +2279,7 @@ def test_deep_graph_source_fallback_is_not_relabelled_as_russian(tmp_path):
 def test_process_uses_translated_transcript_for_analysis_and_graph(tmp_path, monkeypatch):
     pipeline = VideoProcessingPipeline.for_test(tmp_path)
     pipeline.settings = pipeline.settings.__class__(
-        **{**pipeline.settings.__dict__, "enable_translation": True, "target_language": "ru"}
+        **{**pipeline.settings.__dict__, "enable_translation": True, "target_language": "ru", "quality_mode": "best_effort"}
     )
     metadata = VideoMetadata(video_id="abc123def45", canonical_url="https://youtu.be/abc123def45", title="Talk")
     source_transcript = Transcript(

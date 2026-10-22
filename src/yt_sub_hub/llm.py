@@ -722,6 +722,7 @@ class LMStudioAnalyzer:
                     "Return only valid JSON for a scientific Markdown note. "
                     "Required keys: language, cleaned_title, abstract, tags, outline, "
                     "sections, concepts, claims, limitations, open_questions, related_topics. "
+                    "Write every human-readable field in the transcript language, including titles and tags. "
                     "Use timestamp_seconds=0 when a timestamp is unknown."
                 ),
             },
@@ -985,12 +986,13 @@ class LMStudioAnalyzer:
                     "role": "system",
                     "content": (
                         "Analyze this transcript chunk as one section of a scientific note. "
-                        "Return only valid JSON matching the schema. Extract concrete details; do not over-compress."
+                        "Return only valid JSON matching the schema. Extract concrete details; do not over-compress. "
+                        "Write every human-readable field in the transcript language, including headings and concepts."
                     ),
                 },
                 {
                     "role": "user",
-                    "content": f"Video: {metadata.title}\nChunk {index}/{len(chunks)}:\n{chunk}",
+                    "content": f"Video: {metadata.title}\nTranscript language: {transcript.language or 'unknown'}\nChunk {index}/{len(chunks)}:\n{chunk}",
                 },
             ]
             response = self._create_completion(
@@ -1022,12 +1024,13 @@ class LMStudioAnalyzer:
             transcript_text = "\n\n".join(selected)
             transcript_header = "Transcript chunks:"
         else:
-            transcript_text = transcript.full_text()
+            transcript_text = "\n".join(f"[{int(segment.start)}s] {segment.text}" for segment in transcript.segments)
             transcript_header = "Transcript:"
         prompt_prefix = (
             f"Video title: {metadata.title}\n"
             f"Channel: {metadata.channel or 'unknown'}\n"
             f"URL: {metadata.canonical_url}\n\n"
+            f"Transcript language: {transcript.language or 'unknown'}\n"
             "Analyze the transcript in a scientific style. Preserve timestamps by using "
             "timestamp_seconds for each section where possible.\n\n"
         )

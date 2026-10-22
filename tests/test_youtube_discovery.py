@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from typer.testing import CliRunner
+from yt_sub_hub.research_enrichment import _research_artifact_hashes, text_hash
 
 
 def _write_core_and_research(root: Path, video_id: str = "srcVideo123") -> None:
@@ -40,7 +41,9 @@ def _write_core_and_research(root: Path, video_id: str = "srcVideo123") -> None:
     (video_dir / "note.md").write_text("# Graph research lecture\n\nKnowledge graph discovery.\n", encoding="utf-8")
     (video_dir / "review" / "ru_artifact_review.json").write_text(json.dumps({"status": "passed"}), encoding="utf-8")
     (research_dir / "research_plan.json").write_text(
-        json.dumps({"schema_version": "research-enrichment-v1", "research_run_id": "rr-1", "video_id": video_id}),
+        json.dumps({"schema_version": "research-enrichment-v1", "research_run_id": "rr-1", "video_id": video_id,
+                    "source_note_hash": text_hash((video_dir / "note.md").read_text()),
+                    "source_analysis_hash": text_hash(json.dumps(json.loads((video_dir / "analysis.ru.json").read_text()), ensure_ascii=False, sort_keys=True))}),
         encoding="utf-8",
     )
     (research_dir / "findings.ru.json").write_text(
@@ -107,9 +110,11 @@ def _write_core_and_research(root: Path, video_id: str = "srcVideo123") -> None:
         encoding="utf-8",
     )
     (research_dir / "review" / "research_artifact_review.json").write_text(
-        json.dumps({"status": "passed"}),
+        json.dumps({"status": "passed", "research_run_id": "rr-1",
+                    "artifact_hashes": _research_artifact_hashes(research_dir)}),
         encoding="utf-8",
     )
+    (research_dir / "status.json").write_text(json.dumps({"status": "completed", "research_run_id": "rr-1"}))
 
 
 class FakeDiscoveryProvider:
@@ -762,3 +767,23 @@ def test_discovery_graph_sync_rejects_candidate_relationship_missing_id(tmp_path
         assert "relationship video ID" in str(exc)
     else:
         raise AssertionError("graph sync must reject missing relationship ID before Neo4j writes")
+
+
+def test_discovery_rejects_failed_research_retry_and_mismatched_run(tmp_path):
+    import pytest
+    from yt_sub_hub.library import LibraryStore
+    from yt_sub_hub.youtube_discovery import _require_research_ready, DiscoveryValidationError
+    _write_core_and_research(tmp_path)
+    root = tmp_path / 'videos/srcVideo123/research'
+    (root / 'status.json').write_text(json.dumps({'status': 'failed', 'research_run_id': 'rr-1'}))
+    with pytest.raises(DiscoveryValidationError, match='completed'):
+        _require_research_ready(LibraryStore(tmp_path), 'srcVideo123')
+    (root / 'status.json').write_text(json.dumps({'status': 'completed', 'research_run_id': 'new-run'}))
+    with pytest.raises(DiscoveryValidationError, match='run'):
+        _require_research_ready(LibraryStore(tmp_path), 'srcVideo123')
+
+
+def test_search_intent_does_not_determine_semantic_relationship():
+    from yt_sub_hub.youtube_discovery import _relationship_for_query
+    for intent in ['counterpoint', 'deep_dive', 'recent_updates', 'channel_discovery', 'verification']:
+        assert _relationship_for_query({'intent': intent}) == 'unclear'

@@ -460,6 +460,47 @@ def test_enqueue_video_cli_accepts_acceptance_mode_override(tmp_path, monkeypatc
     assert "acceptance_mode" in result.output
 
 
+def test_enqueue_video_updates_modes_on_retry(tmp_path, monkeypatch):
+    url = "https://www.youtube.com/watch?v=abc123def45"
+    monkeypatch.setenv("YT_SUB_HUB_LIBRARY_DIR", str(tmp_path))
+    runner = CliRunner()
+    assert runner.invoke(cli.app, ["enqueue-video", url, "--acceptance-mode", "data_api_only"]).exit_code == 0
+    runtime = RuntimeStore(tmp_path / "index.sqlite3")
+    runtime.fail_video_job(job_id_for_url(url), error="captions forbidden")
+
+    result = runner.invoke(cli.app, ["enqueue-video", url, "--acceptance-mode", "full_processing", "--quality-mode", "best_effort"])
+
+    assert result.exit_code == 0, result.output
+    record = runtime.load_video_job(job_id_for_url(url))
+    assert (record.acceptance_mode, record.quality_mode) == ("full_processing", "best_effort")
+
+
+def test_worker_once_uses_enqueued_modes_instead_of_environment_defaults(tmp_path, monkeypatch):
+    from yt_sub_hub.config import get_settings
+
+    url = "https://www.youtube.com/watch?v=abc123def45"
+    monkeypatch.setenv("YT_SUB_HUB_LIBRARY_DIR", str(tmp_path))
+    monkeypatch.setenv("YT_SUB_HUB_QUALITY_MODE", "strict")
+    monkeypatch.setenv("YT_SUB_HUB_ACCEPTANCE_MODE", "data_api_only")
+    observed = []
+
+    class RecordingPipeline:
+        settings = get_settings()
+
+        def process_job(self, job_id):
+            observed.append((self.settings.quality_mode, self.settings.acceptance_mode))
+            return JobRecord(job_id=job_id, url=url, video_id="abc123def45", status="completed")
+
+    monkeypatch.setattr(cli, "_worker_pipeline", lambda *args: RecordingPipeline())
+    runner = CliRunner()
+    assert runner.invoke(cli.app, ["enqueue-video", url, "--quality-mode", "draft", "--acceptance-mode", "full_processing"]).exit_code == 0
+
+    result = runner.invoke(cli.app, ["worker-once"])
+
+    assert result.exit_code == 0, result.output
+    assert observed == [("draft", "full_processing")]
+
+
 def test_enqueue_channel_cli_creates_channel_job_with_json_status(tmp_path, monkeypatch):
     monkeypatch.setenv("YT_SUB_HUB_LIBRARY_DIR", str(tmp_path))
 

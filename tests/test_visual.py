@@ -426,3 +426,13 @@ def test_analyze_visual_frame_wraps_failures_in_visual_analysis_error():
             extractor=lambda **kwargs: Path("frame.jpg"),
             provider=failing_provider,
         )
+
+
+def test_source_only_visual_save_cannot_be_reused_as_translated_result(tmp_path):
+    store = LibraryStore(tmp_path)
+    paths = store.save_visual_frame('abc123', '000010', raw={},
+        normalized={'timestamp_seconds': 10, 'summary': 'English source'},
+        normalized_source={'timestamp_seconds': 10, 'summary': 'English source'}, summary_variant='source')
+    assert paths.normalized_source.exists()
+    assert not paths.normalized.exists()
+    assert store.load_visual_frame('abc123', '000010') is None

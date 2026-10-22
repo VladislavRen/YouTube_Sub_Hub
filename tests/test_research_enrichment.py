@@ -742,8 +742,17 @@ def _write_research_sync_artifacts(root, *, video_id="abc123def45", review_statu
         ],
     }
     (research_dir / "research_graph.json").write_text(json.dumps(graph), encoding="utf-8")
+    (research_dir.parent / "note.md").write_text("Original note")
+    (research_dir.parent / "analysis.ru.json").write_text("{}")
+    (research_dir / "research_plan.json").write_text(json.dumps({"research_run_id": run_id,
+        "source_note_hash": _research().text_hash("Original note"), "source_analysis_hash": _research().text_hash("{}")}))
+    (research_dir / "status.json").write_text(json.dumps({"status": "completed", "research_run_id": run_id}))
+    (research_dir / "findings.ru.json").write_text("[]")
+    (research_dir / "source_summaries.json").write_text("[]")
+    (research_dir / "research_report.md").write_text("# Research")
     (research_dir / "review" / "research_artifact_review.json").write_text(
-        json.dumps({"status": review_status, "issues": []}),
+        json.dumps({"status": review_status, "issues": [], "research_run_id": run_id,
+                    "artifact_hashes": _research()._research_artifact_hashes(research_dir)}),
         encoding="utf-8",
     )
     return graph
@@ -872,6 +881,11 @@ def test_research_sync_rejects_graph_relationship_without_valid_provenance(tmp_p
     graph = _write_research_sync_artifacts(tmp_path)
     graph["relationships"][0]["quote_validation"] = "failed"
     (tmp_path / "videos" / "abc123def45" / "research" / "research_graph.json").write_text(json.dumps(graph), encoding="utf-8")
+    root = tmp_path / "videos" / "abc123def45" / "research"
+    review_path = root / "review" / "research_artifact_review.json"
+    review = json.loads(review_path.read_text())
+    review["artifact_hashes"] = research._research_artifact_hashes(root)
+    review_path.write_text(json.dumps(review))
 
     try:
         research.sync_research_graph_to_neo4j(
@@ -883,3 +897,123 @@ def test_research_sync_rejects_graph_relationship_without_valid_provenance(tmp_p
         assert "quote_validation" in str(exc)
     else:
         raise AssertionError("sync must reject research graph relationships with failed quote validation")
+
+
+def test_deterministic_research_never_treats_quote_presence_as_claim_support():
+    research = _research()
+    claim = 'MCP гарантирует полную безопасность инструментов.'
+    source = research.FetchedSource(source_id='source-001', url='https://example.com/security',
+        title='Security', text='MCP НЕ гарантирует полную безопасность инструментов.')
+    report = research._build_report('Video', {'claims': [{'text': claim}]}, [source])
+    assert all(item.text != claim and not item.accepted for item in report.claims)
+    markdown = research.render_research_report(report, [source])
+    assert '## Подтверждения' not in markdown
+    assert 'Явные противоречия не выявлены' not in markdown
+    graph = research._build_research_graph('video', 'run', report, [source])
+    findings = [n for n in graph['nodes'] if n['label'] == 'ResearchFinding']
+    assert findings and all(n['accepted'] is False and n['claim_support'] == 'not_assessed' for n in findings)
+
+
+def test_source_excerpt_is_not_mislabeled_as_russian_summary():
+    research = _research()
+    result = research.SearchResult(title='Docs', url='https://example.com/docs', snippet='', rank=1, query_id='q2')
+    source = research.FetchedSource(source_id='source-001', result_ids=[result.result_id], url=result.url,
+        title=result.title, text='Cookies help us provide our services. The actual documentation follows.')
+    queries = [research.ResearchQuery('q1', 'unrelated', 'context'), research.ResearchQuery('q2', 'docs', 'context')]
+    summaries = research._build_source_summaries([source], queries, [result])
+    assert summaries[0]['summary_ru'] is None
+    assert summaries[0]['key_points'] == []
+    assert summaries[0]['excerpt_original'].startswith('Cookies')
+    assert summaries[0]['relevant_query_ids'] == ['q2']
+
+
+def test_failed_research_retry_invalidates_previous_passed_review(tmp_path):
+    import pytest
+    from yt_sub_hub.library import LibraryStore
+    research = _research()
+    video = _write_ready_research_video(tmp_path)
+    review = video / 'research/review/research_artifact_review.json'
+    review.parent.mkdir(parents=True)
+    review.write_text('{"status":"passed","research_run_id":"old"}')
+    class FailingProvider:
+        def search(self, query, limit):
+            raise RuntimeError('search unavailable')
+    with pytest.raises(RuntimeError, match='search unavailable'):
+        research.run_video_research(LibraryStore(tmp_path), 'abc123def45', provider=FailingProvider())
+    assert not review.exists() or json.loads(review.read_text())['status'] != 'passed'
+
+
+def test_empty_ddgs_result_does_not_abort_other_research_queries(monkeypatch):
+    import ddgs
+    import pytest
+    from ddgs.exceptions import DDGSException, TimeoutException
+    research = _research()
+    class Empty:
+        def text(self, *args, **kwargs):
+            raise DDGSException('No results found.')
+    monkeypatch.setattr(ddgs, 'DDGS', Empty)
+    assert research.DuckDuckGoSearchProvider().search('rare long phrase', 5) == []
+    class TimedOut:
+        def text(self, *args, **kwargs):
+            raise TimeoutException('timed out')
+    monkeypatch.setattr(ddgs, 'DDGS', TimedOut)
+    with pytest.raises(RuntimeError, match='timed out'):
+        research.DuckDuckGoSearchProvider().search('query', 5)
+
+
+def test_safe_fetch_preserves_server_significant_url_parts():
+    research = _research()
+    url = 'https://www.example.com/article/?utm_source=search'
+    safe = research.validate_fetch_url(url + '#section', resolve_host=False)
+    assert safe.allowed
+    assert safe.url == url
+    assert research.canonicalize_url(url) == 'https://example.com/article'
+
+
+def test_research_context_quote_prefers_topic_sentence_over_site_navigation():
+    research = _research()
+    source = research.FetchedSource(source_id='s', url='https://example.com/docs', title='Docs',
+        text='Home. Sign in. Cookie settings. Большие языковые модели используют инструменты для анализа данных.')
+    report = research._build_report('Video', {'concepts': [{'name': 'Анализ данных'}]}, [source])
+    quote = report.claims[0].citations[0].quote
+    assert 'анализа данных' in quote
+    assert 'Home' not in quote and 'Cookie' not in quote
+    assert research.validate_quote(quote, source).status == 'exact'
+
+
+def test_context_sources_with_same_title_remain_distinct():
+    research = _research()
+    sources = [research.FetchedSource(source_id=f's{i}', url=f'https://example.com/{i}', title='Reference',
+        text=f'Example source {i} contains context for language models.') for i in [1, 2]]
+    report = research._build_report('Video', {}, sources)
+    assert len({c.claim_id for c in report.claims}) == 2
+    assert research.review_research_enrichment(report, sources).status == 'passed'
+
+
+def test_current_research_run_rejects_changed_core_note(tmp_path):
+    import pytest
+    from yt_sub_hub.library import LibraryStore
+    research = _research()
+    _write_research_sync_artifacts(tmp_path)
+    note = tmp_path / 'videos/abc123def45/note.md'
+    note.write_text('Changed source note')
+    with pytest.raises(research.ResearchValidationError, match='core'):
+        research.require_current_research_run(LibraryStore(tmp_path), 'abc123def45')
+
+
+def test_research_concept_queries_keep_video_topic_context():
+    research = _research()
+    analysis = SimpleNamespace(claims=[], concepts=[SimpleNamespace(name='Галлюцинация')],
+        tags=['LLM', 'ChatGPT'], open_questions=[], cleaned_title='Language models')
+    query = research._build_queries(analysis)[0].query
+    assert 'Галлюцинация' in query and 'LLM' in query
+
+
+def test_research_graph_source_nodes_are_owned_by_each_video_run():
+    research = _research()
+    source = research.FetchedSource(source_id='source-001', url='https://example.com/shared', title='Shared',
+        text='A shared source contains factual text for comparison.')
+    report = research._build_report('Video', {}, [source])
+    first = research._build_research_graph('video-a', 'run-a', report, [source])
+    second = research._build_research_graph('video-b', 'run-b', report, [source])
+    assert {n['id'] for n in first['nodes']}.isdisjoint({n['id'] for n in second['nodes']})

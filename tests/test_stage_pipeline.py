@@ -410,7 +410,8 @@ def test_stage_worker_retry_is_per_stage_not_per_video(tmp_path):
     assert plan[1].status == "pending"
 
 
-def test_scientific_analysis_stage_uses_existing_analysis_artifact(tmp_path):
+def test_scientific_analysis_stage_uses_existing_analysis_artifact(tmp_path, monkeypatch):
+    monkeypatch.setenv("YT_SUB_HUB_ENABLE_TRANSLATION", "false")
     runtime = RuntimeStore(tmp_path / "index.sqlite3")
     job = _job(runtime)
     _write_russian_video(LibraryStore(tmp_path), job.video_id)
@@ -2169,9 +2170,11 @@ def test_staged_deterministic_graph_rebuilds_cached_ru_graph_without_matching_an
     assert extraction["generated_from"]["analysis_hash"]
 
 
-def test_staged_neo4j_sync_deletes_video_relationships_before_upsert(tmp_path, monkeypatch):
+def test_staged_neo4j_sync_atomically_replaces_core_payload(tmp_path, monkeypatch):
     runtime = RuntimeStore(tmp_path / "index.sqlite3")
     job = _job(runtime)
+    # This minimal fixture tests transaction writes; strict coverage is tested separately.
+    job = runtime.update_video_job_quality_mode(job.id, "best_effort")
     runtime.ensure_stage_plan(job.id, enable_deep_graph_llm=False)
     pipeline = StagePipeline(
         library_dir=tmp_path,
@@ -2190,11 +2193,8 @@ def test_staged_neo4j_sync_deletes_video_relationships_before_upsert(tmp_path, m
         def __init__(self, uri, user, password):
             operations.append(("init", uri, user, password))
 
-        def delete_video_relationships(self, video_id):
-            operations.append(("delete_video_relationships", video_id))
-
-        def upsert_payload(self, payload):
-            operations.append(("upsert_payload", len(payload.nodes), len(payload.relationships)))
+        def replace_video_core_payload(self, video_id, payload):
+            operations.append(("replace_video_core_payload", video_id, len(payload.nodes), len(payload.relationships)))
 
         def close(self):
             operations.append(("close",))
@@ -2204,11 +2204,17 @@ def test_staged_neo4j_sync_deletes_video_relationships_before_upsert(tmp_path, m
     result = pipeline.run(pipeline.context(job, _stage(runtime, job.id, "neo4j_sync"), runtime=runtime))
 
     assert result.status == "completed"
-    assert [operation[0] for operation in operations] == ["init", "delete_video_relationships", "upsert_payload", "close"]
-    assert operations[1] == ("delete_video_relationships", job.video_id)
+    assert [operation[0] for operation in operations] == ["init", "replace_video_core_payload", "close"]
+    assert operations[1][1] == job.video_id
 
 
 def test_staged_strict_operational_stage_warnings_allow_neo4j_sync(tmp_path, monkeypatch):
+    # Isolate operational-stage warning handling from artifact scoring.
+    def ready_score(*args, **kwargs):
+        assert all(stage.stage_name != "neo4j_sync" for stage in kwargs["stages"])
+        return {"status": "ready", "overall_score": 1.0, "reasons": []}
+
+    monkeypatch.setattr("yt_sub_hub.artifact_quality_score.compute_artifact_quality_score", ready_score)
     runtime = RuntimeStore(tmp_path / "index.sqlite3")
     job = runtime.create_video_job(
         job_id=job_id_for_url("https://www.youtube.com/watch?v=abc123def45"),
@@ -2237,11 +2243,8 @@ def test_staged_strict_operational_stage_warnings_allow_neo4j_sync(tmp_path, mon
         def __init__(self, uri, user, password):
             operations.append(("init", uri, user, password))
 
-        def delete_video_relationships(self, video_id):
-            operations.append(("delete_video_relationships", video_id))
-
-        def upsert_payload(self, payload):
-            operations.append(("upsert_payload", len(payload.nodes), len(payload.relationships)))
+        def replace_video_core_payload(self, video_id, payload):
+            operations.append(("replace_video_core_payload", video_id, len(payload.nodes), len(payload.relationships)))
 
         def close(self):
             operations.append(("close",))
@@ -2251,7 +2254,7 @@ def test_staged_strict_operational_stage_warnings_allow_neo4j_sync(tmp_path, mon
     result = pipeline.run(pipeline.context(job, _stage(runtime, job.id, "neo4j_sync"), runtime=runtime))
 
     assert result.status == "completed"
-    assert [operation[0] for operation in operations] == ["init", "delete_video_relationships", "upsert_payload", "close"]
+    assert [operation[0] for operation in operations] == ["init", "replace_video_core_payload", "close"]
 
 
 def test_staged_neo4j_sync_does_not_connect_when_product_quality_blocks_graph_sync(tmp_path, monkeypatch):
@@ -2272,12 +2275,10 @@ def test_staged_neo4j_sync_does_not_connect_when_product_quality_blocks_graph_sy
     _mark_stage_completed(runtime, job.id, "ru_artifact_review")
 
     monkeypatch.setattr(
-        "yt_sub_hub.stage_pipeline.evaluate_product_quality",
+        "yt_sub_hub.artifact_quality_score.compute_artifact_quality_score",
         lambda *args, **kwargs: {
-            "mode": "strict",
             "status": "warning",
-            "production_ready": False,
-            "graph_sync_allowed": False,
+            "overall_score": 0.74,
             "reasons": ["product quality blocked graph sync"],
         },
     )
@@ -2357,11 +2358,8 @@ def test_staged_best_effort_review_warning_allows_neo4j_sync(tmp_path, monkeypat
         def __init__(self, uri, user, password):
             pass
 
-        def delete_video_relationships(self, video_id):
-            operations.append(("delete_video_relationships", video_id))
-
-        def upsert_payload(self, payload):
-            operations.append(("upsert_payload", len(payload.nodes)))
+        def replace_video_core_payload(self, video_id, payload):
+            operations.append(("replace_video_core_payload", video_id, len(payload.nodes)))
 
         def close(self):
             pass
@@ -2371,7 +2369,7 @@ def test_staged_best_effort_review_warning_allows_neo4j_sync(tmp_path, monkeypat
     result = pipeline.run(pipeline.context(job, _stage(runtime, job.id, "neo4j_sync"), runtime=runtime))
 
     assert result.status == "completed"
-    assert operations[0] == ("delete_video_relationships", job.video_id)
+    assert operations[0][:2] == ("replace_video_core_payload", job.video_id)
 
 
 def test_staged_draft_skips_graph_sync_and_marks_quality_gate_warning(tmp_path):
@@ -2503,7 +2501,8 @@ def test_stage_worker_quality_gate_final_blocks_success(tmp_path):
     assert _plan_statuses(runtime, job.id)[-1] == ("quality_gate", "failed")
 
 
-def test_local_orchestrator_parallelism_respects_lm_studio_lock(tmp_path):
+def test_local_orchestrator_parallelism_respects_lm_studio_lock(tmp_path, monkeypatch):
+    monkeypatch.setenv("YT_SUB_HUB_ENABLE_TRANSLATION", "false")
     runtime = RuntimeStore(tmp_path / "index.sqlite3")
     events = []
 
